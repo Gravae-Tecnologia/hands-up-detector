@@ -24,12 +24,7 @@ import time
 
 import cv2
 import numpy as np
-
-# onnxruntime NAO e importado aqui de proposito. Em modo nuvem a Pi so
-# desenha o esqueleto que o servidor devolveu e aplica o criterio do gesto -
-# nada disso precisa de ONNX. Deixando o import preguiçoso, a instalacao numa
-# arena que usa a nuvem dispensa o pacote (73 MB) e os modelos (51 MB), e a
-# `desenha`/`gesto_bracos` continuam disponiveis.
+import onnxruntime as ort
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 MODELOS = os.environ.get("MODELOS", os.path.join(DIR, "modelos"))
@@ -38,6 +33,9 @@ DETECTORES = {
     "yolo11n-256": dict(arq="yolo11n_256x416.onnx", entrada=(256, 416), thr=0.25),
     "yolo11n-224": dict(arq="yolo11n_224x352.onnx", entrada=(224, 352), thr=0.25),
     "yolo11n-256-int8": dict(arq="yolo11n_256x416_int8.onnx", entrada=(256, 416), thr=0.25),
+    # Para a nuvem: F1 94,7 contra 90,1 do yolo11n-256, e em CPU x86 custa
+    # 68 ms contra 14 - irrelevante quando o orcamento e 1 segundo.
+    "yolo11s": dict(arq="yolo11s_416x640.onnx", entrada=(416, 640), thr=0.25),
 }
 POSES = {
     "rtmpose-s": dict(arq="rtmpose-s.onnx", entrada=(192, 256)),
@@ -56,12 +54,9 @@ STD = np.array([58.395, 57.12, 57.375], np.float32)
 
 
 def sessao(caminho, threads):
-    import onnxruntime as ort
-
     """2 threads e nao 4 de proposito: medido na Pi 4, 4 threads e 18% MAIS
     LENTO que 2 (472 ms contra 399). Sao 4 nucleos, mas o sistema usa parte
     deles e o custo de sincronizacao supera o ganho no 3o e 4o."""
-
     so = ort.SessionOptions()
     so.log_severity_level = 3
     so.intra_op_num_threads = threads

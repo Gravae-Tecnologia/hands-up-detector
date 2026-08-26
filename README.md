@@ -37,12 +37,47 @@ enquadramento de meio corpo.
 
 ## Instalação
 
-**Na Raspberry da arena:**
+**Na Raspberry da arena — 9 segundos, modo nuvem:**
 
 ```bash
 git clone https://github.com/Gravae-Tecnologia/hands-up-detector
-cd hands-up-detector/rasp && ./instalar.sh
+cd hands-up-detector/rasp
+./instalar.sh --nuvem https://hands-up-detector-....run.app
 ```
+
+É rápido porque instala o mínimo: em modo nuvem a Pi só captura, encoda JPEG e
+desenha o resultado que o servidor devolve — **nada disso precisa de
+onnxruntime nem dos modelos**. O `import onnxruntime` é preguiçoso justamente
+para isso. Use `--local` só em arena sem link bom.
+
+O script é **idempotente** e **não sobrescreve** `/etc/gravae/hands-up.json` —
+uma atualização de parque não pode apagar quais quadras o operador ligou.
+
+### Switches (integração com o OPS)
+
+Tudo nasce **desligado**. Uma atualização que chega em todas as Raspberries não
+pode começar a consumir CPU e banda sozinha.
+
+```bash
+curl localhost:8090/api/config                                    # estado + switches
+curl -XPOST localhost:8090/api/config -d '{"ativo":true}'         # liga o serviço
+curl -XPOST localhost:8090/api/config -d '{"quadra":"campo01","valor":true}'
+curl -XPOST localhost:8090/api/config -d '{"camera":"campo01_camera02","valor":false}'
+```
+
+Dois níveis, e não são redundantes: **quadra** desliga tudo dela de uma vez (o
+caso comum — reforma, fora de horário); **câmera** é o refinamento para um
+ângulo ruim ou defeito. Uma câmera só processa se a quadra dela **e** ela
+mesma estiverem ligadas.
+
+O `GET /api/config` devolve `quadras_detalhe`, já no formato que o OPS precisa
+para desenhar os switches.
+
+### Serviço
+
+Roda sob systemd (`gravae-hands-up.service`), com `Restart=always`,
+`Nice=5` e `CPUWeight=50` — numa disputa, a captura do Shinobi, que é o
+produto, ganha a CPU.
 
 **Na VM de inferência (opcional, modo nuvem):**
 

@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+servidor.py
+instalar.sh
+baixar_modelos.sh

@@ -1,0 +1,24 @@
+[Unit]
+Description=Gravae hands-up detector
+# Depende do Shinobi so para a ordem de boot: as credenciais das cameras sao
+# lidas do MariaDB dele. Nao e Requires - se o Shinobi cair, este servico
+# continua com o que ja leu em vez de morrer junto.
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gravae
+WorkingDirectory=/opt/gravae-hands-up
+ExecStart=/opt/gravae-hands-up/venv/bin/python /opt/gravae-hands-up/servico.py --porta 8090
+Restart=always
+RestartSec=10
+# a Pi da arena ja roda Shinobi e chega a 72 C parada; a prioridade baixa
+# garante que a captura, que e o produto, ganhe a CPU numa disputa
+Nice=5
+CPUWeight=50
+StandardOutput=append:/var/log/gravae-hands-up.log
+StandardError=append:/var/log/gravae-hands-up.log
+
+[Install]
+WantedBy=multi-user.target

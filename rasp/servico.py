@@ -45,6 +45,7 @@ from urllib.parse import urlparse
 import cv2
 import numpy as np
 
+import config as cfgmod
 import motor
 
 DIR = os.path.dirname(os.path.abspath(__file__))
@@ -416,15 +417,22 @@ class Nuvem:
     camera em tela parada sem aviso.
     """
 
-    def __init__(self, url, qualidade=75):
+    def __init__(self, url, qualidade=75, arena="", camera=""):
         u = urlparse(url)
-        self.host, self.porta = u.hostname, u.port or 80
+        self.https = (u.scheme == "https")
+        self.host = u.hostname
+        self.porta = u.port or (443 if self.https else 80)
+        self.caminho = u.path or "/"
         self.qualidade = qualidade
+        self.arena, self.camera = arena, camera
         self.conn = None
         self.lock = threading.Lock()
 
     def _liga(self):
-        self.conn = http.client.HTTPConnection(self.host, self.porta, timeout=30)
+        # Cloud Run so atende HTTPS; VM propria pode ser HTTP simples.
+        cls = (http.client.HTTPSConnection if self.https
+               else http.client.HTTPConnection)
+        self.conn = cls(self.host, self.porta, timeout=30)
 
     def infere(self, img):
         """-> (resultado, ms_encode, ms_rede) ou (None, ms_encode, 0)."""
@@ -441,9 +449,14 @@ class Nuvem:
                     if self.conn is None:
                         self._liga()
                     a = time.perf_counter()
-                    self.conn.request("POST", "/", body=corpo,
-                                      headers={"Content-Type": "image/jpeg",
-                                               "Content-Length": str(len(corpo))})
+                    self.conn.request(
+                        "POST", self.caminho, body=corpo,
+                        headers={"Content-Type": "image/jpeg",
+                                 "Content-Length": str(len(corpo)),
+                                 # multi-tenant: o servidor separa a escala de
+                                 # confianca por camera e loga por arena
+                                 "X-Arena": self.arena,
+                                 "X-Camera": self.camera})
                     r = json.loads(self.conn.getresponse().read())
                     rtt = (time.perf_counter() - a) * 1e3
                     r["_bytes"] = len(corpo)
@@ -598,10 +611,26 @@ listar();
 </script>"""
 
 
+def aplica_config():
+    """Liga e desliga cameras conforme a config. Idempotente de proposito: o
+    OPS pode chamar quantas vezes quiser sem efeito colateral."""
+    ligadas = []
+    for mid, c in H.cams.items():
+        quer = H.conf.ligada(mid)
+        if quer and not c.ativa:
+            c.liga()
+        elif not quer and c.ativa:
+            c.desliga()
+        if quer:
+            ligadas.append(mid)
+    return ligadas
+
+
 class H(BaseHTTPRequestHandler):
     cams = {}
     pool = None
     cfg = {}
+    conf = None
     registro = None
     alertas = []
 
@@ -624,6 +653,19 @@ class H(BaseHTTPRequestHandler):
             return self._json(estatisticas())
         if self.path.startswith("/api/alertas"):
             return self._json(list(reversed(H.alertas[-40:])))
+        if self.path.startswith("/api/config"):
+            # o OPS le isto para desenhar os switches
+            d = dict(H.conf.d)
+            d["arena"] = H.cfg.get("arena", "")
+            d["quadras_detalhe"] = [
+                {"quadra": q,
+                 "ligada": bool(d["quadras"].get(q)),
+                 "cameras": [{"mid": c.mid, "ligada": bool(d["cameras"].get(c.mid)),
+                              "processando": c.ativa}
+                             for c in H.cams.values()
+                             if cfgmod.Config.quadra_de(c.mid) == q]}
+                for q in sorted(d["quadras"])]
+            return self._json(d)
         if self.path.startswith("/quadro/"):
             mid = self.path.split("/")[-1].split(".")[0]
             c = H.cams.get(mid)
@@ -657,6 +699,15 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         d = json.loads(self.rfile.read(n) or b"{}")
+        if self.path.startswith("/api/config"):
+            # chamada pelo OPS: {"ativo":true} | {"quadra":"campo01","valor":true}
+            # | {"camera":"campo01_camera01","valor":false} | {"nuvem":"https://..."}
+            H.conf.define(**{k: v for k, v in d.items()
+                             if k in ("ativo", "quadra", "camera", "valor",
+                                      "nuvem", "webhook", "fps", "qualidade")})
+            aplicada = aplica_config()
+            return self._json({"ok": True, "config": H.conf.d,
+                               "processando": aplicada})
         c = H.cams.get(d.get("mid"))
         if not c:
             return self._json({"erro": "camera desconhecida"})
@@ -757,18 +808,26 @@ def main():
                     help="qualidade do JPEG enviado (so em modo nuvem)")
     ap.add_argument("--webhook", default="",
                     help="URL avisada IMEDIATAMENTE quando detecta o gesto")
+    ap.add_argument("--config", default=None,
+                    help="json de configuracao (padrao /etc/gravae/hands-up.json)")
     ap.add_argument("--registro", default="registro.jsonl",
                     help="arquivo JSONL com todos os tempos, por quadro")
     args = ap.parse_args()
 
+    H.conf = cfgmod.Config(args.config)
     todas = cameras()
-    if args.filtro:
-        pref = tuple(x.strip() for x in args.filtro.split(",") if x.strip())
-        sel = [c for c in todas if c["mid"].startswith(pref)]
-    else:
-        sel = todas
-    print(f"{len(sel)} de {len(todas)} cameras: "
-          f"{', '.join(c['mid'] for c in sel)}", flush=True)
+    H.conf.sincroniza([c["mid"] for c in todas])
+    # a nuvem/webhook da config tem precedencia sobre a linha de comando:
+    # e o OPS que manda, e ele escreve na config
+    if H.conf.d.get("nuvem"):
+        args.nuvem = H.conf.d["nuvem"]
+    if H.conf.d.get("webhook"):
+        args.webhook = H.conf.d["webhook"]
+    args.fps = H.conf.d.get("fps", args.fps)
+    args.qualidade = H.conf.d.get("qualidade", args.qualidade)
+    sel = todas
+    print(f"{len(sel)} cameras | ativo={H.conf.d['ativo']} | "
+          f"config={H.conf.caminho}", flush=True)
 
     dev = {}
     try:
@@ -787,11 +846,13 @@ def main():
     if args.nuvem:
         # Cliente magro: a Pi so decodifica, encoda JPEG e envia. Nenhum
         # modelo e carregado aqui - e o ponto do modo nuvem.
-        import http.client as _h
         u = urlparse(args.nuvem)
         try:
-            c0 = _h.HTTPConnection(u.hostname, u.port or 80, timeout=15)
-            c0.request("GET", "/")
+            _cls = (http.client.HTTPSConnection if u.scheme == "https"
+                    else http.client.HTTPConnection)
+            c0 = _cls(u.hostname, u.port or (443 if u.scheme == "https" else 80),
+                      timeout=20)
+            c0.request("GET", u.path or "/")
             info = json.loads(c0.getresponse().read())
             print(f"nuvem: {args.nuvem} | {info.get('modelo')} | "
                   f"{info.get('provider')}", flush=True)
@@ -801,11 +862,11 @@ def main():
         H.pool = None
         for c in sel:
             cam = Camera(c, args.largura, args.altura, args.fps)
-            cam.nuvem = Nuvem(args.nuvem, args.qualidade)
+            cam.nuvem = Nuvem(args.nuvem, args.qualidade,
+                              arena=dev.get("shinobiGroupKey", ""),
+                              camera=c["mid"])
             H.cams[c["mid"]] = cam
-            cam.liga()          # todas ligadas: a Pi nao esta inferindo
-        print(f"{len(sel)} cameras enviando para a nuvem a {args.fps} fps",
-              flush=True)
+        print(f"modo nuvem a {args.fps} fps", flush=True)
     else:
         H.pool = Pool(args.workers, args.det, args.pose, args.threads,
                       args.max_pessoas)
@@ -820,7 +881,11 @@ def main():
                 time.sleep(0.08)
         threading.Thread(target=despachante, daemon=True).start()
 
-    print(f"painel em http://0.0.0.0:{args.porta}", flush=True)
+    H.cfg["arena"] = dev.get("shinobiGroupKey", "")
+    ligadas = aplica_config()
+    print(f"processando agora: {ligadas or 'nenhuma (ligue pelo OPS)'}",
+          flush=True)
+    print(f"servico em http://0.0.0.0:{args.porta}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", args.porta), H).serve_forever()
 
 
