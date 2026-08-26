@@ -302,9 +302,11 @@ class Camera:
         a = time.time()
         res = avisa_plataforma(
             H.cfg.get("webhook"), H.cfg.get("api_key"), self.cam["nome"], n_g,
-            {"camera": self.mid, "pessoas": pessoas,
+            {"cam": self.mid, "camera": self.mid, "pessoas": pessoas,
+             "gestos": n_g,
              "detectado_em": t_resp,
-             "latencia_ms": round((t_resp - t_cap) * 1e3, 1)})
+             "latencia_ms": round((t_resp - t_cap) * 1e3, 1)},
+            serial=H.cfg.get("serial", ""))
         H.alertas.append({"t": a, "hora": time.strftime("%H:%M:%S"),
                           "cam": self.mid, "gestos": n_g,
                           "latencia_deteccao_ms": round((t_resp - t_cap) * 1e3, 1),
@@ -365,7 +367,7 @@ class Registro:
             self.n += 1
 
 
-def avisa_plataforma(url, api_key, cam, n_gestos, detalhe):
+def avisa_plataforma(url, api_key, cam, n_gestos, detalhe, serial=""):
     """POST imediato no gesto.
 
     NAO passa pelo Phoenix de proposito: o daemon dele enfileira em SQLite e
@@ -380,6 +382,11 @@ def avisa_plataforma(url, api_key, cam, n_gestos, detalhe):
     if not url:
         return None
     corpo = json.dumps({
+        # O serial e quem identifica o device no OPS: e o unico identificador
+        # que TODA Pi tem a mao (device.json -> deviceId). O `apiKey` abaixo
+        # carrega o shinobiApiKey e vai junto so por compatibilidade com o
+        # formato do Phoenix - o OPS nao guarda esse valor em coluna.
+        "serial": serial,
         "apiKey": api_key,
         "alerts": [{
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -836,7 +843,10 @@ def main():
         pass
     H.cfg = {"threads": args.threads, "fps": args.fps, "nuvem": args.nuvem,
              "t0": time.time(), "webhook": args.webhook,
-             "api_key": dev.get("shinobiApiKey", "")}
+             "api_key": dev.get("shinobiApiKey", ""),
+             # `deviceId` no device.json E o serial do Raspberry - e como o
+             # OPS reconhece esta Pi, no poll e no aviso do gesto.
+             "serial": str(dev.get("deviceId", ""))}
     if args.registro:
         H.registro = Registro(os.path.join(DIR, args.registro))
         print(f"registro: {os.path.join(DIR, args.registro)}", flush=True)

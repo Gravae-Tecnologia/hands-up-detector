@@ -40,6 +40,13 @@ class Config:
             "altura": 400,
             "quadras": {},        # {"campo01": true}
             "cameras": {},        # {"campo01_camera01": true}
+            # URL do /api/hands-up/config do OPS. Quando preenchida, os
+            # switches acima passam a ser ESPELHO do que esta la - o operador
+            # liga pela tela, nao por curl na Pi.
+            "ops": "",
+            # Versao da ultima config aplicada do OPS. Serve para so reescrever
+            # este arquivo quando algo mudou de verdade (I/O em cartao SD).
+            "versao_ops": 0,
         }
         self.carrega()
 
