@@ -9,7 +9,11 @@ Duas formas de rodar, com a mesma interface:
 | modo | onde infere | quando usar |
 |---|---|---|
 | **local** | na própria Pi | arena sem link bom; 1 câmera por vez |
-| **nuvem** | numa VM com GPU | recomendado — libera a CPU da Pi e usa modelo maior |
+| **nuvem** | Cloud Run (CPU) | recomendado — libera a CPU da Pi e usa modelo maior |
+
+📄 **[CLAUDE.md](CLAUDE.md)** — contexto para quem for mexer: invariantes,
+armadilhas já pagas e o que está em aberto.
+📊 **[MEDICOES.md](MEDICOES.md)** — todos os números, com o ambiente de cada um.
 
 ---
 
