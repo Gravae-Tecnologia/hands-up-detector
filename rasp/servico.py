@@ -40,7 +40,7 @@ import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 import cv2
 import numpy as np
@@ -300,21 +300,29 @@ class Camera:
 
     def _avisa(self, n_g, pessoas, t_cap, t_resp):
         a = time.time()
+        # GRAVA PRIMEIRO, avisa depois. O lance esta acontecendo agora: cada
+        # milissegundo gasto no POST da plataforma e um pedaco do lance que o
+        # Shinobi ainda nao comecou a gravar. O aviso pode chegar 200 ms mais
+        # tarde sem prejuizo; o video, nao.
+        gravou = dispara_gravacao(self.mid, H.cfg.get("api_key"),
+                                  H.cfg.get("arena"))
         res = avisa_plataforma(
             H.cfg.get("webhook"), H.cfg.get("api_key"), self.cam["nome"], n_g,
             {"cam": self.mid, "camera": self.mid, "pessoas": pessoas,
              "gestos": n_g,
              "detectado_em": t_resp,
-             "latencia_ms": round((t_resp - t_cap) * 1e3, 1)},
+             "latencia_ms": round((t_resp - t_cap) * 1e3, 1),
+             "gravacao": gravou},
             serial=H.cfg.get("serial", ""))
         H.alertas.append({"t": a, "hora": time.strftime("%H:%M:%S"),
-                          "cam": self.mid, "gestos": n_g,
+                          "cam": self.mid, "gestos": n_g, "gravacao": gravou,
                           "latencia_deteccao_ms": round((t_resp - t_cap) * 1e3, 1),
                           "webhook": res})
         del H.alertas[:-200]
         if H.registro:
             H.registro.escreve(cam=self.mid, evento="aviso_plataforma",
                                gestos=n_g, t_aviso=a, webhook=res,
+                               gravacao=gravou,
                                latencia_deteccao_ms=round((t_resp - t_cap) * 1e3, 1))
 
     def registra(self, img, caixas, kpts, ms, ms_det, ms_pose):
@@ -365,6 +373,63 @@ class Registro:
         with self.lock:
             self.f.write(json.dumps(kw, ensure_ascii=False) + "\n")
             self.n += 1
+
+
+#: Intervalo minimo entre dois triggers da MESMA camera.
+#:
+#: O gesto dura mais que um quadro: a 1 fps, um braco levantado por 4 segundos
+#: dispararia 4 gravacoes empilhadas do mesmo lance. O daemon de botao tem o
+#: mesmo problema resolvido por debounce no GPIO; aqui e por tempo. 15 s cobre
+#: a janela de video do Shinobi sem perder um segundo aperto de verdade.
+TRIGGER_COOLDOWN = float(os.environ.get("HANDS_UP_TRIGGER_COOLDOWN", 15))
+_ultimo_trigger = {}
+
+
+def dispara_gravacao(mid, api_key, group_key, shinobi="http://127.0.0.1:8080"):
+    """Manda o Shinobi gravar a camera que positivou.
+
+    E EXATAMENTE a chamada do daemon de botoes - mesma rota `/motion/`, mesmo
+    `force=1`. O que muda e so a origem no `data`, para o evento no Shinobi
+    dizer de onde veio: aperto de botao ou bracos levantados.
+
+    A CAMERA E A QUE POSITIVOU, nao a quadra inteira: o `mid` que chega aqui e
+    o da imagem onde o gesto foi visto. Uma quadra com duas cameras grava a que
+    viu o gesto.
+
+    Sem `apiKey` ou `groupKey` no device.json nao ha o que fazer - devolve o
+    motivo em vez de estourar, porque isto roda numa thread solta e uma excecao
+    aqui morreria calada.
+    """
+    if not api_key or not group_key:
+        return {"ok": False, "erro": "sem apiKey/groupKey no device.json"}
+
+    agora = time.time()
+    ultimo = _ultimo_trigger.get(mid, 0)
+    if agora - ultimo < TRIGGER_COOLDOWN:
+        return {"ok": False, "ignorado": "cooldown",
+                "faltam_s": round(TRIGGER_COOLDOWN - (agora - ultimo), 1)}
+    _ultimo_trigger[mid] = agora
+
+    dados = urlencode({
+        "data": json.dumps({"plug": "hands-up", "reason": "hands_up"}),
+        "force": "1",
+    })
+    url = f"{shinobi.rstrip('/')}/{api_key}/motion/{group_key}/{mid}?{dados}"
+    a = time.perf_counter()
+    try:
+        u = urlparse(url)
+        cls = (http.client.HTTPSConnection if u.scheme == "https"
+               else http.client.HTTPConnection)
+        c = cls(u.hostname, u.port, timeout=5)
+        c.request("GET", u.path + ("?" + u.query if u.query else ""))
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return {"ok": r.status == 200, "status": r.status,
+                "ms": round((time.perf_counter() - a) * 1e3, 1)}
+    except Exception as e:
+        return {"ok": False, "erro": type(e).__name__,
+                "ms": round((time.perf_counter() - a) * 1e3, 1)}
 
 
 def avisa_plataforma(url, api_key, cam, n_gestos, detalhe, serial=""):
