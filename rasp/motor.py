@@ -199,6 +199,35 @@ class Pipeline:
         return caixas, kpts
 
 
+def gesto_margem(k, conf_min=0.3, escala_conf=1.0):
+    """Quanto o gesto esta ACIMA ou ABAIXO do criterio, em larguras de ombro.
+
+    O criterio original devolve sim/nao, o que joga fora a informacao mais
+    util para calibrar: o quanto faltou. Aqui a saida e continua -
+
+        >= 0,35  gesto (o limiar atual)
+        0,15..0,35  quase: e o que revela falso NEGATIVO na revisao
+        < 0,15   nao e gesto
+
+    O valor e o MENOR dos dois lados, porque o criterio exige os dois bracos.
+    Devolve None quando nem da para avaliar (confianca baixa ou ombros
+    colados, que e o caso da pessoa de perfil).
+    """
+    c = k[:, 2] / max(escala_conf, 1e-6)
+    if min(c[[5, 6, 7, 8, 9, 10]]) < conf_min:
+        return None
+    larg = float(np.linalg.norm(k[5, :2] - k[6, :2]))
+    if larg < 1.0:
+        return None
+    # cotovelo acima do ombro e condicao dura: sem ela, aceno com a mao na
+    # altura da cabeca passaria por braco levantado
+    if not (k[7, 1] < k[5, 1] and k[8, 1] < k[6, 1]):
+        return -1.0
+    esq = (k[5, 1] - k[9, 1]) / larg
+    dir = (k[6, 1] - k[10, 1]) / larg
+    return float(min(esq, dir))
+
+
 def gesto_bracos(k, margem=0.35, conf_min=0.3, escala_conf=1.0):
     """punho.y < ombro.y - margem*largura_ombros nos dois lados, e cotovelo
     acima do ombro. Exigir o cotovelo separa braco levantado de aceno com a

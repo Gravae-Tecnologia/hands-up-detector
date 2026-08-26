@@ -42,7 +42,8 @@ fi
 
 echo "==> codigo em $DESTINO"
 sudo mkdir -p "$DESTINO"
-sudo cp "$DIR"/servico.py "$DIR"/motor.py "$DIR"/config.py "$DESTINO/"
+# copia todos os modulos: esquecer um so aparece no boot do servico
+sudo cp "$DIR"/*.py "$DESTINO/"
 [ "$MODO" = local ] && sudo cp -r "$DIR/modelos" "$DESTINO/"
 sudo chown -R gravae:gravae "$DESTINO"
 

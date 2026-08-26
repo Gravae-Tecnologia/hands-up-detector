@@ -47,6 +47,8 @@ import numpy as np
 
 import config as cfgmod
 import motor
+import rastreio as rastmod
+import revisao as revmod
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 NUVEM = None          # http.client.HTTPConnection por camera, se modo nuvem
@@ -127,8 +129,12 @@ class Camera:
         self.m = {"capturados": 0, "processados": 0, "descartados": 0,
                   "pessoas": 0, "gestos": 0, "ms": 0.0, "ms_det": 0.0,
                   "ms_pose": 0.0, "ms_encode": 0.0, "ms_rede": 0.0,
-                  "kb": 0.0, "falhas": 0, "ultimo_gesto": 0.0, "amostras": []}
+                  "kb": 0.0, "falhas": 0, "ultimo_gesto": 0.0,
+                  "instantaneos": 0, "segurando": 0.0, "amostras": []}
         self.nuvem = None
+        # um rastreador POR CAMERA: pessoas de quadras diferentes nao se
+        # confundem, e cada camera tem sua propria escala de pixels
+        self.rast = rastmod.Rastreador(dur_s=H.cfg.get("dur_gesto", 2.0))
         self.parar = threading.Event()
         self.thread = None
         threading.Thread(target=self.foto, daemon=True).start()
@@ -248,11 +254,40 @@ class Camera:
             self.erro = None
             kpts = [np.array(k, np.float32) for k in r.get("kpts", [])]
             caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
-            gestos = [False] * len(kpts)
-            # o servidor ja aplicou o criterio; aqui so marcamos quais
-            for i in range(min(r.get("gestos", 0), len(kpts))):
-                gestos[i] = True
-            motor.desenha(img, caixas, kpts, conf_min=0.0, gestos=gestos)
+            # margem continua por pessoa: e o que permite recalibrar o limiar
+            # depois sem recapturar nada
+            margens = [motor.gesto_margem(k) for k in kpts]
+
+            # confirmacao temporal ANTES de desenhar: o gesto so vale se a
+            # MESMA pessoa segurar por `dur_s`. Sem rastreio, dois quadros de
+            # pessoas diferentes pareceriam uma segurando.
+            por_pessoa, confirmados = self.rast.passo(
+                kpts, margens, revmod.LIMIAR, agora=t_resp)
+            n_g = len(confirmados)
+            n_inst = sum(1 for p in por_pessoa if p["instantaneo"])
+
+            # a pessoa de MAIOR margem e a que interessa registrar: e quem
+            # esta com os bracos mais levantados no quadro
+            i_pico, pico = -1, None
+            for i, mm in enumerate(margens):
+                if mm is not None and (pico is None or mm > pico):
+                    i_pico, pico = i, mm
+            # copia LIMPA antes de desenhar: o esqueleto cobre o rosto, e o
+            # historico existe justamente para reconhecer quem levantou a mao.
+            # So copia quando ha evidencia a guardar - 768 KB por quadro seria
+            # desperdicio a 1 fps sem gesto nenhum.
+            precisa = (H.revisao is not None and pico is not None
+                       and pico >= revmod.QUASE)
+            img_limpo = img.copy() if precisa else None
+
+            motor.desenha(img, caixas, kpts, conf_min=0.0,
+                          gestos=[p["confirmado"] for p in por_pessoa])
+            for i, p in enumerate(por_pessoa):
+                if p["instantaneo"] and not p["confirmado"] and i < len(caixas):
+                    # marca quem esta segurando mas ainda nao completou
+                    x1, y1 = int(caixas[i][0]), int(caixas[i][1])
+                    cv2.putText(img, f"{p['segurando_s']:.0f}s", (x1, max(y1 - 26, 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 200, 255), 2)
             total = ms_encode + ms_rede + r.get("ms_servidor", 0)
             cv2.putText(img, f"{self.cam[chr(39)+chr(39)] if False else self.cam['nome']}"
                         f"  NUVEM {total:.0f}ms  {len(kpts)}p",
@@ -264,8 +299,10 @@ class Camera:
             m = self.m
             m["processados"] += 1
             m["pessoas"] = len(kpts)
-            m["gestos"] += r.get("gestos", 0)
-            if r.get("gestos", 0):
+            m["gestos"] += n_g
+            m["instantaneos"] += n_inst
+            m["segurando"] = max((p["segurando_s"] for p in por_pessoa), default=0.0)
+            if n_g:
                 m["ultimo_gesto"] = time.time()
             m["ms"] = total
             m["ms_encode"], m["ms_rede"] = ms_encode, ms_rede
@@ -275,7 +312,18 @@ class Camera:
             m["amostras"].append(total)
             del m["amostras"][:-120]
 
-            n_g = r.get("gestos", 0)
+            if precisa:
+                # captura tambem os "quase": sem eles so da para medir
+                # precisao, nunca recall - falso negativo e invisivel
+                pp = por_pessoa[i_pico] if i_pico < len(por_pessoa) else {}
+                H.revisao.guarda(
+                    img, self.mid, pico, len(kpts), (t_resp - t_cap) * 1e3,
+                    caixa=caixas[i_pico] if i_pico < len(caixas) else None,
+                    img_limpo=img_limpo,
+                    extra={"modelo": r.get("modelo"),
+                           "segurando_s": pp.get("segurando_s", 0.0),
+                           "confirmado": bool(pp.get("confirmado")),
+                           "trilha": pp.get("id")})
             if H.registro:
                 H.registro.escreve(
                     cam=self.mid, evento="gesto" if n_g else "quadro",
@@ -608,7 +656,9 @@ tr.alerta{animation:pisca 1s infinite}
 </style>
 <h1>Esqueletos ao vivo &mdash; 1 quadro por segundo</h1>
 <div class=sub>Clique numa camera para <b>ligar</b> a analise. So ela captura e processa &mdash;
-as outras param o ffmpeg por completo, para nao gastar CPU a toa.</div>
+as outras param o ffmpeg por completo, para nao gastar CPU a toa.<br>
+<a href="/pessoas" style="color:#7c5cff">quem levantou as maos</a> &middot;
+<a href="/revisao" style="color:#7c5cff">validar deteccoes</a></div>
 <div class=grade id=grade></div>
 
 <h2>Processamento</h2>
@@ -698,12 +748,170 @@ def aplica_config():
     return ligadas
 
 
+PAGINA_REVISAO = """<!doctype html><meta charset=utf-8><title>Revisao de gestos</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0b0d11;color:#e8eaed;font:14px system-ui,sans-serif;margin:0;padding:20px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:#8b93a7;font-size:13px;margin-bottom:16px}
+.res{display:flex;gap:26px;flex-wrap:wrap;background:#12151c;border:1px solid #1e222b;
+border-radius:10px;padding:14px 18px;margin-bottom:18px}
+.res div{min-width:78px}
+.res b{display:block;font-size:20px;font-weight:600}
+.res span{color:#8b93a7;font-size:12px}
+.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.ev{background:#12151c;border:2px solid #1e222b;border-radius:10px;overflow:hidden}
+.ev.sim{border-color:#4ade80}.ev.nao{border-color:#ff6b6b}
+.ev img{width:100%;display:block;background:#000;cursor:zoom-in;aspect-ratio:4/3;object-fit:cover}
+.tags{display:flex;gap:6px;padding:0 10px 6px;flex-wrap:wrap}
+.tag{font-size:10px;font-weight:700;letter-spacing:.3px;padding:2px 6px;border-radius:4px}
+.tag.conf{background:#3a1020;color:#ff6b8a}
+.tag.seg{background:#1a2436;color:#7cc4ff}
+.tag.tr{background:#1e1a2e;color:#a78bfa}
+.filtros{display:flex;gap:8px;margin-bottom:14px}
+.filtros button{background:#12151c;color:#8b93a7;border:1px solid #1e222b;border-radius:7px;
+padding:7px 14px;cursor:pointer;font-size:13px}
+.filtros button.on{border-color:#7c5cff;color:#e8eaed}
+.meta{padding:8px 10px;font-size:12px;color:#8b93a7;display:flex;justify-content:space-between}
+.m{font-weight:700}
+.m.alto{color:#7c5cff}.m.quase{color:#fbbf24}
+.bt{display:flex;gap:6px;padding:0 10px 10px}
+.bt button{flex:1;background:#1a1d24;color:#e8eaed;border:1px solid #2a2f3a;
+border-radius:6px;padding:7px;cursor:pointer;font-size:12px}
+.bt button:hover{border-color:#7c5cff}
+.bt .on-sim{background:#14361f;border-color:#4ade80}
+.bt .on-nao{background:#3a1015;border-color:#ff6b6b}
+.vazio{color:#8b93a7;padding:50px;text-align:center}
+</style>
+<h1>Revisao de gestos</h1>
+<div class=sub>Historico de quem levantou as maos, com o esqueleto desenhado.
+A foto e um <b>recorte ampliado da pessoa</b> &mdash; clique para ver o quadro inteiro.
+Marque <b>era gesto</b> ou <b>nao era</b> e o limiar sai do dado em vez de palpite.</div>
+<div class=res id=res></div>
+<div class=filtros>
+  <button id=f_tudo class=on onclick="filtra('tudo')">tudo</button>
+  <button id=f_conf onclick="filtra('conf')">so confirmados (maos levantadas)</button>
+  <button id=f_quase onclick="filtra('quase')">so os &quot;quase&quot;</button>
+</div>
+<div class=grade id=g></div>
+<script>
+let filtro='tudo';
+function filtra(f){
+  filtro=f;
+  ['tudo','conf','quase'].forEach(x=>
+    document.getElementById('f_'+x).classList.toggle('on',x===f));
+  carrega();
+}
+async function carrega(){
+  const d=await (await fetch('/api/revisao')).json();
+  const r=d.resumo;
+  document.getElementById('res').innerHTML=`
+    <div><b>${r.capturadas}</b><span>capturadas</span></div>
+    <div><b>${r.rotuladas}</b><span>rotuladas</span></div>
+    <div><b style="color:#4ade80">${r.vp}</b><span>acertos</span></div>
+    <div><b style="color:#ff6b6b">${r.fp}</b><span>falso positivo</span></div>
+    <div><b style="color:#fbbf24">${r.fn}</b><span>falso negativo</span></div>
+    <div><b>${r.precisao}%</b><span>precisao</span></div>
+    <div><b>${r.recall}%</b><span>recall</span></div>
+    <div><b>${r.f1}</b><span>F1 @ ${r.limiar}</span></div>
+    ${r.sugestao?`<div><b style="color:#7c5cff">${r.sugestao.limiar}</b><span>limiar sugerido (F1 ${r.sugestao.f1})</span></div>`:''}`;
+  let itens=d.itens;
+  if(filtro==='conf') itens=itens.filter(x=>x.confirmado);
+  if(filtro==='quase') itens=itens.filter(x=>!x.gesto);
+  document.getElementById('g').innerHTML = itens.length ? itens.map(it=>`
+    <div class="ev ${it.rotulo||''}" id="e_${it.id}">
+      <img src="/revisao/${it.id}${it.tem_recorte?'_p':''}.jpg"
+           title="clique para ver o quadro inteiro"
+           onclick="window.open('/revisao/${it.id}.jpg')">
+      <div class=tags>
+        ${it.confirmado?'<span class="tag conf">MAOS LEVANTADAS</span>':''}
+        ${it.segurando_s?`<span class="tag seg">segurou ${it.segurando_s.toFixed(0)}s</span>`:''}
+        ${it.trilha?`<span class="tag tr">#${it.trilha}</span>`:''}
+      </div>
+      <div class=meta>
+        <span>${it.cam} &middot; ${it.hora}</span>
+        <span class="m ${it.gesto?'alto':'quase'}">${it.margem.toFixed(2)}</span>
+      </div>
+      <div class=bt>
+        <button class="${it.rotulo==='sim'?'on-sim':''}" onclick="rot('${it.id}','sim')">era gesto</button>
+        <button class="${it.rotulo==='nao'?'on-nao':''}" onclick="rot('${it.id}','nao')">nao era</button>
+      </div>
+    </div>`).join('') : '<div class=vazio>nada capturado ainda</div>';
+}
+async function rot(id,v){
+  const el=document.getElementById('e_'+id);
+  const atual=el.classList.contains(v)?'':v;
+  await fetch('/api/rotular',{method:'POST',body:JSON.stringify({id,rotulo:atual})});
+  carrega();
+}
+carrega(); setInterval(carrega,10000);
+</script>"""
+
+
+PAGINA_PESSOAS = """<!doctype html><meta charset=utf-8><title>Quem levantou as maos</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0b0d11;color:#e8eaed;font:14px system-ui,sans-serif;margin:0;padding:20px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:#8b93a7;font-size:13px;margin-bottom:16px}
+.sub a{color:#7c5cff}
+.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.p{background:#12151c;border:1px solid #1e222b;border-radius:12px;overflow:hidden}
+.p img{width:100%;display:block;aspect-ratio:3/4;object-fit:cover;background:#000;cursor:zoom-in}
+.p .i{padding:9px 11px}
+.p .q{font-weight:600;font-size:13px}
+.p .h{color:#8b93a7;font-size:12px;margin-top:2px}
+.b{display:inline-block;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-top:6px}
+.b.conf{background:#3a1020;color:#ff6b8a}
+.b.inst{background:#2a2410;color:#fbbf24}
+.filtros{display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap}
+.filtros button{background:#12151c;color:#8b93a7;border:1px solid #1e222b;border-radius:7px;
+padding:7px 14px;cursor:pointer;font-size:13px}
+.filtros button.on{border-color:#7c5cff;color:#e8eaed}
+.vazio{color:#8b93a7;padding:50px;text-align:center}
+</style>
+<h1>Quem levantou as maos</h1>
+<div class=sub>Foto <b>sem o esqueleto</b>, para reconhecer a pessoa. Clique para o
+quadro inteiro. &mdash; <a href="/revisao">ver com esqueleto e validar</a> &middot;
+<a href="/">cameras</a></div>
+<div class=filtros>
+  <button id=p_conf class=on onclick="fil('conf')">confirmados (segurou o gesto)</button>
+  <button id=p_tudo onclick="fil('tudo')">todos os registros</button>
+  <span id=cont class=sub style="margin:0 0 0 auto"></span>
+</div>
+<div class=grade id=g></div>
+<script>
+let f='conf';
+function fil(x){f=x;['conf','tudo'].forEach(k=>
+  document.getElementById('p_'+k).classList.toggle('on',k===x));carrega();}
+async function carrega(){
+  const d=await (await fetch('/api/revisao')).json();
+  let it=d.itens.filter(x=>x.tem_rosto);
+  if(f==='conf') it=it.filter(x=>x.confirmado);
+  document.getElementById('cont').textContent=`${it.length} registro(s)`;
+  document.getElementById('g').innerHTML= it.length ? it.map(x=>`
+    <div class=p>
+      <img src="/revisao/${x.id}_r.jpg" onclick="window.open('/revisao/${x.id}.jpg')">
+      <div class=i>
+        <div class=q>${x.cam.replace('_camera',' &middot; cam ')}</div>
+        <div class=h>${x.hora}</div>
+        <span class="b ${x.confirmado?'conf':'inst'}">${x.confirmado
+          ?'SEGUROU '+(x.segurando_s||0).toFixed(0)+'S':'INSTANTANEO'}</span>
+      </div>
+    </div>`).join('')
+    : '<div class=vazio>nenhum registro com foto ainda &mdash; as fotos comecam a partir do proximo gesto</div>';
+}
+carrega(); setInterval(carrega,8000);
+</script>"""
+
+
 class H(BaseHTTPRequestHandler):
     cams = {}
     pool = None
     cfg = {}
     conf = None
     registro = None
+    revisao = None
     alertas = []
 
     def log_message(self, *a):
@@ -723,6 +931,34 @@ class H(BaseHTTPRequestHandler):
                                 "res": c.cam["res"]} for c in H.cams.values()])
         if self.path.startswith("/api/stats"):
             return self._json(estatisticas())
+        if self.path.startswith("/api/revisao"):
+            if H.revisao is None:
+                return self._json({"itens": [], "resumo": {}})
+            itens = [dict(x, rotulo=H.revisao.rotulos.get(x["id"], ""))
+                     for x in H.revisao.itens[:120]]
+            return self._json({"itens": itens, "resumo": H.revisao.resumo()})
+        if self.path.startswith("/revisao/") and self.path.endswith(".jpg"):
+            nome = os.path.basename(self.path)
+            cam = os.path.join(H.revisao.pasta, nome) if H.revisao else ""
+            if not cam or not os.path.exists(cam):
+                self.send_response(404); self.end_headers(); return
+            b = open(cam, "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/pessoas"):
+            b = PAGINA_PESSOAS.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/revisao"):
+            b = PAGINA_REVISAO.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
         if self.path.startswith("/api/alertas"):
             return self._json(list(reversed(H.alertas[-40:])))
         if self.path.startswith("/api/config"):
@@ -771,12 +1007,22 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         d = json.loads(self.rfile.read(n) or b"{}")
+        if self.path.startswith("/api/rotular"):
+            if H.revisao is None:
+                return self._json({"erro": "revisao desligada"})
+            return self._json(H.revisao.rotula(d.get("id", ""), d.get("rotulo", "")))
         if self.path.startswith("/api/config"):
             # chamada pelo OPS: {"ativo":true} | {"quadra":"campo01","valor":true}
             # | {"camera":"campo01_camera01","valor":false} | {"nuvem":"https://..."}
             H.conf.define(**{k: v for k, v in d.items()
                              if k in ("ativo", "quadra", "camera", "valor",
-                                      "nuvem", "webhook", "fps", "qualidade")})
+                                      "nuvem", "webhook", "fps", "qualidade",
+                                      "dur_gesto")})
+            if "dur_gesto" in d:
+                # aplica nas cameras ja rodando, sem reiniciar o servico
+                H.cfg["dur_gesto"] = H.conf.d["dur_gesto"]
+                for c in H.cams.values():
+                    c.rast.dur_s = H.cfg["dur_gesto"]
             aplicada = aplica_config()
             return self._json({"ok": True, "config": H.conf.d,
                                "processando": aplicada})
@@ -817,6 +1063,7 @@ def estatisticas():
             "ms_det": m["ms_det"], "ms_pose": m["ms_pose"],
             "ms_encode": m["ms_encode"], "ms_rede": m["ms_rede"],
             "kb": m["kb"], "falhas": m["falhas"],
+            "instantaneos": m["instantaneos"], "segurando": m["segurando"],
             "alerta": (time.time() - m["ultimo_gesto"]) < 8,
             "ocupacao": (m["ms"] / 10.0) if c.ativa else 0.0,
             "erro": c.erro,
@@ -882,10 +1129,13 @@ def main():
                     help="URL avisada IMEDIATAMENTE quando detecta o gesto")
     ap.add_argument("--config", default=None,
                     help="json de configuracao (padrao /etc/gravae/hands-up.json)")
+    ap.add_argument("--revisao", default="gestos",
+                    help="pasta das evidencias de gesto; vazio desliga")
     ap.add_argument("--registro", default="registro.jsonl",
                     help="arquivo JSONL com todos os tempos, por quadro")
     args = ap.parse_args()
 
+    H.cfg = {}
     H.conf = cfgmod.Config(args.config)
     todas = cameras()
     H.conf.sincroniza([c["mid"] for c in todas])
@@ -897,6 +1147,7 @@ def main():
         args.webhook = H.conf.d["webhook"]
     args.fps = H.conf.d.get("fps", args.fps)
     args.qualidade = H.conf.d.get("qualidade", args.qualidade)
+    H.cfg["dur_gesto"] = H.conf.d.get("dur_gesto", 2.0)
     sel = todas
     print(f"{len(sel)} cameras | ativo={H.conf.d['ativo']} | "
           f"config={H.conf.caminho}", flush=True)
@@ -906,12 +1157,19 @@ def main():
         dev = json.load(open("/etc/gravae/device.json"))
     except Exception:
         pass
-    H.cfg = {"threads": args.threads, "fps": args.fps, "nuvem": args.nuvem,
-             "t0": time.time(), "webhook": args.webhook,
-             "api_key": dev.get("shinobiApiKey", ""),
-             # `deviceId` no device.json E o serial do Raspberry - e como o
-             # OPS reconhece esta Pi, no poll e no aviso do gesto.
-             "serial": str(dev.get("deviceId", ""))}
+    # `update` e nao atribuicao: `dur_gesto` ja foi posto em H.cfg acima e as
+    # cameras leem dele ao serem criadas
+    H.cfg.update({"threads": args.threads, "fps": args.fps,
+                  "nuvem": args.nuvem, "t0": time.time(),
+                  "webhook": args.webhook,
+                  "api_key": dev.get("shinobiApiKey", ""),
+                  # `deviceId` no device.json E o serial do Raspberry - e como
+                  # o OPS reconhece esta Pi, no aviso do gesto.
+                  "serial": str(dev.get("deviceId", ""))})
+    if args.revisao:
+        H.revisao = revmod.Revisao(os.path.join(DIR, args.revisao))
+        print(f"revisao: {H.revisao.pasta} "
+              f"({len(H.revisao.itens)} evidencias) -> /revisao", flush=True)
     if args.registro:
         H.registro = Registro(os.path.join(DIR, args.registro))
         print(f"registro: {os.path.join(DIR, args.registro)}", flush=True)
