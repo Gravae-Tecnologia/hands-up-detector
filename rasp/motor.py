@@ -243,12 +243,34 @@ def gesto_bracos(k, margem=0.35, conf_min=0.3, escala_conf=1.0):
                 k[7, 1] < k[5, 1] and k[8, 1] < k[6, 1])
 
 
-def desenha(img, caixas, kpts, conf_min=0.3, escala_conf=1.0, gestos=None):
+def cor_trilha(tid):
+    """Cor estavel e distinta por id de trilha.
+
+    O angulo aureo (137,508 graus) espalha matizes consecutivos o mais longe
+    possivel no circulo de cores - trilhas #7 e #8 saem visualmente diferentes,
+    o que nao aconteceria com um passo fixo. Saturacao e valor altos porque a
+    quadra e clara e cor pastel some no fundo.
+
+    Cor no lugar do numero: identidade se le de relance. Se a caixa de uma
+    pessoa parada troca de cor entre quadros, o rastreio a perdeu - e isso
+    salta aos olhos sem precisar ler nada.
+    """
+    h = int((tid * 137.508) % 180)          # OpenCV usa H em 0..179
+    bgr = cv2.cvtColor(np.uint8([[[h, 235, 255]]]), cv2.COLOR_HSV2BGR)
+    return tuple(int(v) for v in bgr[0][0])
+
+
+def desenha(img, caixas, kpts, conf_min=0.3, escala_conf=1.0, gestos=None,
+            trilhas=None):
     for i, k in enumerate(kpts):
         ativo = gestos[i] if gestos else False
-        cor = (60, 60, 240) if ativo else (80, 230, 80)
+        # a COR e a identidade da pessoa; a ESPESSURA e o estado do gesto.
+        # Dois canais separados: trocar de cor denuncia rastreio perdido,
+        # engrossar mostra gesto confirmado - e um nao esconde o outro.
+        cor = (cor_trilha(trilhas[i]) if trilhas and i < len(trilhas)
+               else ((60, 60, 240) if ativo else (80, 230, 80)))
         x1, y1, x2, y2 = [int(v) for v in caixas[i]]
-        cv2.rectangle(img, (x1, y1), (x2, y2), cor, 2 if ativo else 1)
+        cv2.rectangle(img, (x1, y1), (x2, y2), cor, 3 if ativo else 1)
         c = k[:, 2] / max(escala_conf, 1e-6)
         for a, b in ESQUELETO:
             if c[a] >= conf_min and c[b] >= conf_min:
@@ -258,6 +280,12 @@ def desenha(img, caixas, kpts, conf_min=0.3, escala_conf=1.0, gestos=None):
             if c[j] >= conf_min:
                 cv2.circle(img, (int(k[j, 0]), int(k[j, 1])), 3, (255, 255, 255), -1)
         if ativo:
-            cv2.putText(img, "BRACOS LEVANTADOS", (x1, max(y1 - 8, 14)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 240), 2)
+            # fundo solido atras do texto: sobre a quadra clara, texto colorido
+            # sem contraste fica ilegivel justamente no quadro que importa
+            txt = "BRACOS LEVANTADOS"
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(img, (x1, max(y1 - th - 12, 0)),
+                          (x1 + tw + 8, max(y1 - 4, th + 8)), cor, -1)
+            cv2.putText(img, txt, (x1 + 4, max(y1 - 9, th + 2)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 2)
     return img

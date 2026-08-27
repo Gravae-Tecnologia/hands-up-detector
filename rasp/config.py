@@ -42,6 +42,12 @@ class Config:
             # 2 s sao 2 a 3 amostras - ver `tol_s` no rastreio, que tolera uma
             # deteccao perdida no meio sem zerar o timer.
             "dur_gesto": 2.0,
+            # quantas conversas simultaneas com a nuvem por camera. Subir
+            # NAO multiplica o custo (a taxa de quadros continua limitada pela
+            # captura); o que aumenta a conta e deixar de descartar quadro.
+            "em_voo_max": 4,
+            "em_voo_min": 1,
+            "ajuste_s": 10.0,
             "quadras": {},        # {"campo01": true}
             "cameras": {},        # {"campo01_camera01": true}
             # URL do /api/hands-up/config do OPS. Quando preenchida, os

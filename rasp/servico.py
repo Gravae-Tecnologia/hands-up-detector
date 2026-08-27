@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 
 import config as cfgmod
+import cronologia as cronmod
 import motor
 import rastreio as rastmod
 import revisao as revmod
@@ -132,6 +133,7 @@ class Camera:
                   "kb": 0.0, "falhas": 0, "ultimo_gesto": 0.0,
                   "instantaneos": 0, "segurando": 0.0, "amostras": []}
         self.nuvem = None
+        self.cron = None
         # um rastreador POR CAMERA: pessoas de quadras diferentes nao se
         # confundem, e cada camera tem sua propria escala de pixels
         self.rast = rastmod.Rastreador(dur_s=H.cfg.get("dur_gesto", 2.0))
@@ -166,10 +168,16 @@ class Camera:
             return
         self.ativa = True
         self.parar.clear()
+        if self.nuvem is not None:
+            self.cron = cronmod.Cronologia(
+                enviar=self._envia_nuvem, consumir=self._consome,
+                fps=self.fps, nome=self.mid,
+                em_voo_min=H.cfg.get("em_voo_min", 1),
+                em_voo_max=H.cfg.get("em_voo_max", 4),
+                ajuste_s=H.cfg.get("ajuste_s", 10.0))
+            self.cron.inicia()
         self.thread = threading.Thread(target=self._captura, daemon=True)
         self.thread.start()
-        if self.nuvem is not None:
-            threading.Thread(target=self._laco_nuvem, daemon=True).start()
 
     def desliga(self):
         if not self.ativa:
@@ -179,6 +187,9 @@ class Camera:
         if self.thread:
             self.thread.join(timeout=8)
         self.thread = None
+        if self.cron is not None:
+            self.cron.para()
+            self.cron = None
         with self.lock:
             self.novo = False
         threading.Thread(target=self.foto, daemon=True).start()
@@ -201,16 +212,25 @@ class Camera:
                         break
                     img = np.frombuffer(buf, np.uint8).reshape(
                         self.alt, self.larg, 3).copy()
-                    with self.lock:
-                        # o quadro anterior nao chegou a ser processado: e
-                        # descarte, e conta como tal
-                        if self.novo:
+                    self.m["capturados"] += 1
+                    self.erro = None
+                    if self.cron is not None:
+                        # o pipe e SEMPRE lido (senao o buffer do ffmpeg enche
+                        # e entrega quadro velho depois); a Cronologia decide
+                        # se este vira requisicao ou e recusado. Os dois
+                        # motivos de recusa sao contados separados nela
+                        # (`decimados` x `sem_vaga`) - somar os dois num
+                        # "descartados" so esconderia qual dos dois esta
+                        # acontecendo.
+                        if not self.cron.oferece(img):
                             self.m["descartados"] += 1
-                        self.quadro = img
-                        self.t_quadro = time.time()
-                        self.novo = True
-                        self.m["capturados"] += 1
-                        self.erro = None
+                    else:
+                        with self.lock:
+                            if self.novo:
+                                self.m["descartados"] += 1
+                            self.quadro = img
+                            self.t_quadro = time.time()
+                            self.novo = True
             finally:
                 p.kill()
             if not self.parar.is_set():
@@ -223,128 +243,138 @@ class Camera:
             self.novo = False
             return self.quadro
 
-    def _laco_nuvem(self):
-        """Captura -> JPEG -> POST -> desenha. Nenhuma inferencia na Pi.
+    def _envia_nuvem(self, q):
+        """Roda nas threads de envio da Cronologia. Pode bloquear na rede.
 
-        Roda uma thread por camera porque a chamada e ligada a I/O: enquanto
-        uma espera a resposta, as outras usam a rede. Um pool de 2 workers,
-        que e o certo para CPU, seria o gargalo errado aqui.
+        Levantar excecao marca o quadro como falho e a janela avanca sem
+        travar a camera - por isso o erro nao e engolido aqui.
         """
-        while not self.parar.is_set():
-            img = t_cap = None
-            with self.lock:
-                if self.novo:
-                    img, t_cap, self.novo = self.quadro, self.t_quadro, False
-            if img is None:
-                self.parar.wait(0.05)
-                continue
-            t_envio = time.time()
-            r, ms_encode, ms_rede = self.nuvem.infere(img)
-            t_resp = time.time()
-            if r is None or "erro" in r:
-                self.erro = (r or {}).get("erro", "sem resposta")
-                self.m["falhas"] += 1
-                if H.registro:
-                    H.registro.escreve(cam=self.mid, evento="falha",
-                                       erro=self.erro,
-                                       t_captura=t_cap, t_envio=t_envio,
-                                       t_resposta=t_resp,
-                                       ms_encode=round(ms_encode, 1))
-                continue
-            self.erro = None
-            kpts = [np.array(k, np.float32) for k in r.get("kpts", [])]
-            caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
-            # margem continua por pessoa: e o que permite recalibrar o limiar
-            # depois sem recapturar nada
-            margens = [motor.gesto_margem(k) for k in kpts]
+        r, ms_encode, ms_rede = self.nuvem.infere(q.img)
+        if r is None or "erro" in r:
+            raise RuntimeError((r or {}).get("erro", "sem resposta"))
+        return r, {"ms_encode": ms_encode, "ms_rede": ms_rede}
 
-            # confirmacao temporal ANTES de desenhar: o gesto so vale se a
-            # MESMA pessoa segurar por `dur_s`. Sem rastreio, dois quadros de
-            # pessoas diferentes pareceriam uma segurando.
-            por_pessoa, confirmados = self.rast.passo(
-                kpts, margens, revmod.LIMIAR, agora=t_resp)
-            n_g = len(confirmados)
-            n_inst = sum(1 for p in por_pessoa if p["instantaneo"])
+    def _consome(self, q):
+        """Roda numa thread unica, SEMPRE em ordem de seq.
 
-            # a pessoa de MAIOR margem e a que interessa registrar: e quem
-            # esta com os bracos mais levantados no quadro
-            i_pico, pico = -1, None
-            for i, mm in enumerate(margens):
-                if mm is not None and (pico is None or mm > pico):
-                    i_pico, pico = i, mm
-            # copia LIMPA antes de desenhar: o esqueleto cobre o rosto, e o
-            # historico existe justamente para reconhecer quem levantou a mao.
-            # So copia quando ha evidencia a guardar - 768 KB por quadro seria
-            # desperdicio a 1 fps sem gesto nenhum.
-            precisa = (H.revisao is not None and pico is not None
-                       and pico >= revmod.QUASE)
-            img_limpo = img.copy() if precisa else None
-
-            motor.desenha(img, caixas, kpts, conf_min=0.0,
-                          gestos=[p["confirmado"] for p in por_pessoa])
-            for i, p in enumerate(por_pessoa):
-                if p["instantaneo"] and not p["confirmado"] and i < len(caixas):
-                    # marca quem esta segurando mas ainda nao completou
-                    x1, y1 = int(caixas[i][0]), int(caixas[i][1])
-                    cv2.putText(img, f"{p['segurando_s']:.0f}s", (x1, max(y1 - 26, 12)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 200, 255), 2)
-            total = ms_encode + ms_rede + r.get("ms_servidor", 0)
-            cv2.putText(img, f"{self.cam[chr(39)+chr(39)] if False else self.cam['nome']}"
-                        f"  NUVEM {total:.0f}ms  {len(kpts)}p",
-                        (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            ok, enc = cv2.imencode(".jpg", img,
-                                   [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-            if ok:
-                self.saida = enc.tobytes()
-            m = self.m
-            m["processados"] += 1
-            m["pessoas"] = len(kpts)
-            m["gestos"] += n_g
-            m["instantaneos"] += n_inst
-            m["segurando"] = max((p["segurando_s"] for p in por_pessoa), default=0.0)
-            if n_g:
-                m["ultimo_gesto"] = time.time()
-            m["ms"] = total
-            m["ms_encode"], m["ms_rede"] = ms_encode, ms_rede
-            m["ms_det"] = r.get("ms_infer", 0.0)
-            m["ms_pose"] = r.get("ms_servidor", 0.0) - r.get("ms_infer", 0.0)
-            m["kb"] = r.get("_bytes", 0) / 1024
-            m["amostras"].append(total)
-            del m["amostras"][:-120]
-
-            if precisa:
-                # captura tambem os "quase": sem eles so da para medir
-                # precisao, nunca recall - falso negativo e invisivel
-                pp = por_pessoa[i_pico] if i_pico < len(por_pessoa) else {}
-                H.revisao.guarda(
-                    img, self.mid, pico, len(kpts), (t_resp - t_cap) * 1e3,
-                    caixa=caixas[i_pico] if i_pico < len(caixas) else None,
-                    img_limpo=img_limpo,
-                    extra={"modelo": r.get("modelo"),
-                           "segurando_s": pp.get("segurando_s", 0.0),
-                           "confirmado": bool(pp.get("confirmado")),
-                           "trilha": pp.get("id")})
+        O relogio do rastreio e `q.t_captura`, nao o instante da resposta: com
+        a latencia variando de 400 a 3.420 ms, usar a chegada faria o
+        `segurando_s` do gesto carregar o jitter da rede em vez do tempo real
+        que a pessoa segurou os bracos.
+        """
+        if q.erro:
+            self.erro = q.erro
+            self.m["falhas"] += 1
             if H.registro:
-                H.registro.escreve(
-                    cam=self.mid, evento="gesto" if n_g else "quadro",
-                    pessoas=len(kpts), gestos=n_g,
-                    t_captura=t_cap, t_envio=t_envio, t_resposta=t_resp,
-                    fila_ms=round((t_envio - t_cap) * 1e3, 1),
-                    ms_encode=round(ms_encode, 1),
-                    ms_rede=round(ms_rede, 1),
-                    ms_servidor=r.get("ms_servidor"),
-                    ms_infer=r.get("ms_infer"),
-                    ms_decode=r.get("ms_decode"),
-                    ms_total=round(total, 1),
-                    ms_captura_ate_resposta=round((t_resp - t_cap) * 1e3, 1),
-                    kb=round(m["kb"], 1), modelo=r.get("modelo"),
-                    temp=round(temperatura(), 1))
-            if n_g:
-                # aviso na hora, fora do laco: a rede da plataforma nao pode
-                # atrasar o proximo quadro
-                threading.Thread(
-                    target=self._avisa, args=(n_g, len(kpts), t_cap, t_resp),
-                    daemon=True).start()
+                H.registro.escreve(cam=self.mid, evento="falha", seq=q.seq,
+                                   erro=q.erro, t_captura=q.t_captura,
+                                   t_envio=q.t_envio, t_resposta=q.t_resposta)
+            return
+        img, t_cap = q.img, q.t_captura
+        t_envio, t_resp = q.t_envio, q.t_resposta
+        r = q.resultado
+        ms_encode = q.meta.get("ms_encode", 0.0)
+        ms_rede = q.meta.get("ms_rede", 0.0)
+        self.erro = None
+        kpts = [np.array(k, np.float32) for k in r.get("kpts", [])]
+        caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
+        # margem continua por pessoa: e o que permite recalibrar o limiar
+        # depois sem recapturar nada
+        margens = [motor.gesto_margem(k) for k in kpts]
+
+        # confirmacao temporal ANTES de desenhar: o gesto so vale se a
+        # MESMA pessoa segurar por `dur_s`. Sem rastreio, dois quadros de
+        # pessoas diferentes pareceriam uma segurando.
+        por_pessoa, confirmados = self.rast.passo(
+            kpts, margens, revmod.LIMIAR, caixas=caixas, agora=t_cap)
+        n_g = len(confirmados)
+        n_inst = sum(1 for p in por_pessoa if p["instantaneo"])
+
+        # a pessoa de MAIOR margem e a que interessa registrar: e quem
+        # esta com os bracos mais levantados no quadro
+        i_pico, pico = -1, None
+        for i, mm in enumerate(margens):
+            if mm is not None and (pico is None or mm > pico):
+                i_pico, pico = i, mm
+        # copia LIMPA antes de desenhar: o esqueleto cobre o rosto, e o
+        # historico existe justamente para reconhecer quem levantou a mao.
+        # So copia quando ha evidencia a guardar - 768 KB por quadro seria
+        # desperdicio a 1 fps sem gesto nenhum.
+        precisa = (H.revisao is not None and pico is not None
+                   and pico >= revmod.QUASE)
+        img_limpo = img.copy() if precisa else None
+
+        motor.desenha(img, caixas, kpts, conf_min=0.0,
+                      gestos=[p["confirmado"] for p in por_pessoa],
+                      trilhas=[p["id"] for p in por_pessoa])
+        for i, p in enumerate(por_pessoa):
+            if i >= len(caixas):
+                return
+            x1, y1 = int(caixas[i][0]), int(caixas[i][1])
+            if p["instantaneo"] and not p["confirmado"]:
+                cv2.putText(img, f"{p['segurando_s']:.1f}s",
+                            (x1, max(y1 - 22, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 200, 255), 2)
+        total = ms_encode + ms_rede + r.get("ms_servidor", 0)
+        rr = self.rast.resumo()
+        cv2.putText(img, f"{self.cam['nome']}  {total:.0f}ms  {len(kpts)}p  "
+                    f"trilhas {rr['trilhas_vivas']}  "
+                    f"int {rr['intervalo_s']:.1f}s  tol {rr['tolerancia_s']:.1f}s",
+                    (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        ok, enc = cv2.imencode(".jpg", img,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if ok:
+            self.saida = enc.tobytes()
+        m = self.m
+        m["processados"] += 1
+        m["pessoas"] = len(kpts)
+        m["gestos"] += n_g
+        m["instantaneos"] += n_inst
+        m["segurando"] = max((p["segurando_s"] for p in por_pessoa), default=0.0)
+        if n_g:
+            m["ultimo_gesto"] = time.time()
+        m["ms"] = total
+        m["ms_encode"], m["ms_rede"] = ms_encode, ms_rede
+        m["ms_det"] = r.get("ms_infer", 0.0)
+        m["ms_pose"] = r.get("ms_servidor", 0.0) - r.get("ms_infer", 0.0)
+        m["kb"] = r.get("_bytes", 0) / 1024
+        m["amostras"].append(total)
+        del m["amostras"][:-120]
+
+        if precisa:
+            # captura tambem os "quase": sem eles so da para medir
+            # precisao, nunca recall - falso negativo e invisivel
+            pp = por_pessoa[i_pico] if i_pico < len(por_pessoa) else {}
+            H.revisao.guarda(
+                img, self.mid, pico, len(kpts), (t_resp - t_cap) * 1e3,
+                caixa=caixas[i_pico] if i_pico < len(caixas) else None,
+                img_limpo=img_limpo,
+                extra={"modelo": r.get("modelo"),
+                       "segurando_s": pp.get("segurando_s", 0.0),
+                       "confirmado": bool(pp.get("confirmado")),
+                       "trilha": pp.get("id")})
+        if H.registro:
+            H.registro.escreve(
+                cam=self.mid, evento="gesto" if n_g else "quadro",
+                pessoas=len(kpts), gestos=n_g,
+                t_captura=t_cap, t_envio=t_envio, t_resposta=t_resp,
+                fila_ms=round((t_envio - t_cap) * 1e3, 1),
+                ms_encode=round(ms_encode, 1),
+                ms_rede=round(ms_rede, 1),
+                ms_servidor=r.get("ms_servidor"),
+                ms_infer=r.get("ms_infer"),
+                ms_decode=r.get("ms_decode"),
+                ms_total=round(total, 1),
+                ms_captura_ate_resposta=round((t_resp - t_cap) * 1e3, 1),
+                kb=round(m["kb"], 1), modelo=r.get("modelo"),
+                temp=round(temperatura(), 1))
+        if n_g:
+            # aviso na hora, fora do laco: a rede da plataforma nao pode
+            # atrasar o proximo quadro
+            threading.Thread(
+                target=self._avisa, args=(n_g, len(kpts), t_cap, t_resp),
+                daemon=True).start()
+        q.img = None      # so agora o quadro cru pode ser liberado
 
     def _avisa(self, n_g, pessoas, t_cap, t_resp):
         a = time.time()
@@ -545,14 +575,17 @@ class Nuvem:
         self.caminho = u.path or "/"
         self.qualidade = qualidade
         self.arena, self.camera = arena, camera
-        self.conn = None
-        self.lock = threading.Lock()
+        # UMA CONEXAO POR THREAD, nao uma sob lock: com varias requisicoes em
+        # voo, um lock em volta do request/response serializaria tudo de novo
+        # e a concorrencia nao existiria. `threading.local` da a cada thread
+        # de envio a sua propria conexao keep-alive.
+        self._local = threading.local()
 
     def _liga(self):
         # Cloud Run so atende HTTPS; VM propria pode ser HTTP simples.
         cls = (http.client.HTTPSConnection if self.https
                else http.client.HTTPConnection)
-        self.conn = cls(self.host, self.porta, timeout=30)
+        self._local.conn = cls(self.host, self.porta, timeout=30)
 
     def infere(self, img):
         """-> (resultado, ms_encode, ms_rede) ou (None, ms_encode, 0)."""
@@ -563,32 +596,31 @@ class Nuvem:
         if not ok:
             return None, ms_encode, 0.0
         corpo = enc.tobytes()
-        with self.lock:
-            for tentativa in (1, 2):
+        for tentativa in (1, 2):
+            try:
+                if getattr(self._local, "conn", None) is None:
+                    self._liga()
+                a = time.perf_counter()
+                self._local.conn.request(
+                    "POST", self.caminho, body=corpo,
+                    headers={"Content-Type": "image/jpeg",
+                             "Content-Length": str(len(corpo)),
+                             # multi-tenant: o servidor separa a escala de
+                             # confianca por camera e loga por arena
+                             "X-Arena": self.arena,
+                             "X-Camera": self.camera})
+                r = json.loads(self._local.conn.getresponse().read())
+                rtt = (time.perf_counter() - a) * 1e3
+                r["_bytes"] = len(corpo)
+                return r, ms_encode, rtt - r.get("ms_servidor", 0)
+            except Exception as e:
                 try:
-                    if self.conn is None:
-                        self._liga()
-                    a = time.perf_counter()
-                    self.conn.request(
-                        "POST", self.caminho, body=corpo,
-                        headers={"Content-Type": "image/jpeg",
-                                 "Content-Length": str(len(corpo)),
-                                 # multi-tenant: o servidor separa a escala de
-                                 # confianca por camera e loga por arena
-                                 "X-Arena": self.arena,
-                                 "X-Camera": self.camera})
-                    r = json.loads(self.conn.getresponse().read())
-                    rtt = (time.perf_counter() - a) * 1e3
-                    r["_bytes"] = len(corpo)
-                    return r, ms_encode, rtt - r.get("ms_servidor", 0)
-                except Exception as e:
-                    try:
-                        self.conn.close()
-                    except Exception:
-                        pass
-                    self.conn = None
-                    if tentativa == 2:
-                        return {"erro": f"{type(e).__name__}"}, ms_encode, 0.0
+                    self._local.conn.close()
+                except Exception:
+                    pass
+                self._local.conn = None
+                if tentativa == 2:
+                    return {"erro": f"{type(e).__name__}"}, ms_encode, 0.0
         return None, ms_encode, 0.0
 
 
@@ -1017,7 +1049,8 @@ class H(BaseHTTPRequestHandler):
             H.conf.define(**{k: v for k, v in d.items()
                              if k in ("ativo", "quadra", "camera", "valor",
                                       "nuvem", "webhook", "fps", "qualidade",
-                                      "dur_gesto")})
+                                      "dur_gesto", "em_voo_max", "em_voo_min",
+                                      "ajuste_s")})
             if "dur_gesto" in d:
                 # aplica nas cameras ja rodando, sem reiniciar o servico
                 H.cfg["dur_gesto"] = H.conf.d["dur_gesto"]
@@ -1064,6 +1097,8 @@ def estatisticas():
             "ms_encode": m["ms_encode"], "ms_rede": m["ms_rede"],
             "kb": m["kb"], "falhas": m["falhas"],
             "instantaneos": m["instantaneos"], "segurando": m["segurando"],
+            "rastreio": c.rast.resumo(),
+            "cronologia": c.cron.resumo() if c.cron else None,
             "alerta": (time.time() - m["ultimo_gesto"]) < 8,
             "ocupacao": (m["ms"] / 10.0) if c.ativa else 0.0,
             "erro": c.erro,
@@ -1148,6 +1183,8 @@ def main():
     args.fps = H.conf.d.get("fps", args.fps)
     args.qualidade = H.conf.d.get("qualidade", args.qualidade)
     H.cfg["dur_gesto"] = H.conf.d.get("dur_gesto", 2.0)
+    for k, padrao in (("em_voo_max", 4), ("em_voo_min", 1), ("ajuste_s", 10.0)):
+        H.cfg[k] = H.conf.d.get(k, padrao)
     sel = todas
     print(f"{len(sel)} cameras | ativo={H.conf.d['ativo']} | "
           f"config={H.conf.caminho}", flush=True)
