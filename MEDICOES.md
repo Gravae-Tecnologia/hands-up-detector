@@ -215,3 +215,60 @@ sem **positivos** do domínio não há o que aprender. O conjunto de teste tem 1
 positivos — dois acertos a mais mudam o F1 em 10 pontos.
 
 **Bloqueado por dados, não por engenharia.**
+
+---
+
+## 9. Aproveitamento de quadros — uma requisição por vez custava 10%
+
+Com **uma** requisição em voo por câmera, a Pi manda um quadro e fica parada até
+a resposta. Medido em **8.697 quadros** da CTF Marcelinho:
+
+| | |
+|---|---|
+| p90 fim a fim | **1.211 ms** contra captura a cada **1.000 ms** |
+| rede (ida + volta) | **228 ms** — 31% do total, tempo morto dos dois lados |
+| quadro capturado durante a espera | **descartado** |
+
+Onde a composição do tempo aparece:
+
+| perna | fatia |
+|---|---|
+| inferência no servidor | **58%** |
+| rede | **31%** |
+| encode + fila na Pi | **1%** |
+
+O descarte não é uniforme: ele se concentra em **quadra cheia**, que é quando o
+sistema importa. Com 8 pessoas o servidor leva 938 ms, e aí quase todo quadro
+seguinte cai.
+
+### Depois da `cronologia.py` (até 4 requisições em voo, adaptativo)
+
+Medido nas três câmeras da CTF Marcelinho, 168 quadros capturados por câmera:
+
+| câmera | capturados | processados | aproveitamento | em voo | sem vaga |
+|---|---|---|---|---|---|
+| quadra01 | 168 | 167 | **99%** | 1/4 | 0 |
+| quadra02 | 168 | 164 | **98%** | 1/4 | 2 |
+| quadra03 | 168 | 166 | **99%** | 1/4 | 0 |
+
+Contra **~90%** de linha de base. Temperatura **77,9 °C**, `throttled=0x0` — a
+concorrência sobrepõe espera de rede, não cria trabalho de CPU, então o eixo
+térmico (invariante 1) não se mexe.
+
+**O custo do Cloud Run sobe junto**, e por um motivo bom: a conta é
+`quadros x ms por quadro`, e passamos a pagar pelos ~10% que antes eram jogados
+fora. A taxa de quadros continua limitada pela captura (1/s por câmera) —
+concorrência **sobrepõe** chamadas, não cria chamadas novas.
+
+### O que a concorrência custa na Pi
+
+4 conexões keep-alive e até 4 JPEGs de ~21 KB em voo por câmera. Irrelevante nos
+2,5 GB livres. O que **não** é irrelevante: sem uma conexão keep-alive por
+thread, cada quadro pagaria handshake TCP, que na arena passa de 200 ms — quase
+o tempo de rede inteiro.
+
+### Um portão que recusava 38% dos quadros
+
+O ritmo alvo estava em exatamente `1/fps`. O ffmpeg entrega a **~0,98 s**, então
+o quadro chegava "cedo" e era recusado. O piso virou **`0,85/fps`**. Vale para
+qualquer portão de tempo neste projeto: o relógio da fonte não é o seu.

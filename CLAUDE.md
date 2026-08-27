@@ -21,7 +21,7 @@ Exigir o **cotovelo** é o que separa braço levantado de aceno na altura da
 cabeça. A régua de escala é a largura de ombros, não o torso — torso não
 existe em enquadramento de meio corpo.
 
-## As três invariantes que não se quebram
+## As quatro invariantes que não se quebram
 
 **1. O gargalo é térmico, não CPU.** A Pi de arena fica em **72 °C parada**,
 com o Shinobi rodando. O throttling começa aos 80 °C. Com quatro capturas
@@ -36,6 +36,15 @@ núcleo por câmera**. Por isso a captura só roda em câmera ligada.
 
 **3. Nada nasce ligado.** Uma atualização que chega em centenas de Raspberries
 não pode começar a consumir CPU e banda sozinha. O operador liga pelo OPS.
+
+**4. O relógio do rastreio é a CAPTURA, nunca a resposta.** A inferência
+mora na nuvem e a latência varia de **400 a 3.420 ms**. Se o rastreio for
+alimentado com o instante em que a resposta chegou, o `segurando_s` do gesto
+mede jitter de rede em vez do tempo real da pessoa — e com várias requisições
+em voo ele chega a andar para trás. `rast.passo(..., agora=q.t_captura)`. Pela
+mesma razão, resultado que volta fora de ordem é **reordenado antes** de tocar
+o rastreio (`cronologia.py`), e resultado que chega depois do seu lugar é
+descartado: melhor perder um quadro que corromper o estado temporal.
 
 ## Dois eixos independentes (isto foi medido, não suposto)
 
