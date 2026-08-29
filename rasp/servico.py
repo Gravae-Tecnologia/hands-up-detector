@@ -141,10 +141,26 @@ class Camera:
         self.thread = None
         threading.Thread(target=self.foto, daemon=True).start()
 
-    def foto(self):
-        """Um quadro so, para a miniatura. Custa um ffmpeg de ~2 s e acabou."""
+    def foto(self, tentativas=3):
+        """Um quadro so, para a miniatura. Custa um ffmpeg de ~2 s e acabou.
+
+        RETENTA, e o motivo e um bug real: a `foto` so era chamada no
+        construtor e no `desliga`. Uma falha unica deixava `saida` em None
+        para SEMPRE, e como o `/quadro/` so escreve quando ha bytes, o <img>
+        do painel nunca recebia nada e o tile aparecia PRETO ate alguem ligar
+        a camera. Falhar na primeira e comum: a camera ja serve o stream
+        principal para o Shinobi e para a nossa captura, e recusa a sessao a
+        mais.
+
+        A guarda tambem estava errada. Era `if ok and not self.ativa`, entao
+        uma foto que terminasse depois da camera ser ligada era JOGADA FORA -
+        e como ela leva ate 40 s, isso acontece toda vez que o servico sobe
+        com camera ja ligada. Agora so nao sobrescreve quadro ANOTADO: se a
+        miniatura ainda e None, vale mesmo com a camera ligada.
+        """
         n = self.larg * self.alt * 3
-        try:
+        for _t in range(tentativas):
+          try:
             p = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
                  "-rtsp_transport", "tcp", "-i", self.cam["rtsp"],
@@ -156,12 +172,15 @@ class Camera:
                     self.alt, self.larg, 3)
                 ok, enc = cv2.imencode(".jpg", img,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                if ok and not self.ativa:
+                if ok and (not self.ativa or self.saida is None):
                     self.saida = enc.tobytes()
+                return
             else:
-                self.erro = p.stderr.decode("utf-8", "replace").strip()[:120]
-        except Exception as e:
+                self.erro = (p.stderr.decode("utf-8", "replace").strip()[:120]
+                             or "sem quadro")
+          except Exception as e:
             self.erro = f"{type(e).__name__}"
+          time.sleep(3 * (_t + 1))
 
     def liga(self):
         if self.ativa:
@@ -425,6 +444,18 @@ class Camera:
         m["ms"], m["ms_det"], m["ms_pose"] = ms, ms_det, ms_pose
         m["amostras"].append(ms)
         del m["amostras"][:-120]
+
+
+def _marcador(nome, larg, alt):
+    """JPEG cinza com o nome da camera, para o tile nunca ficar preto."""
+    img = np.full((alt, larg, 3), 26, np.uint8)
+    cv2.putText(img, nome, (14, alt // 2 - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (130, 130, 130), 1, cv2.LINE_AA)
+    cv2.putText(img, "miniatura indisponivel - tentando de novo",
+                (14, alt // 2 + 18), cv2.FONT_HERSHEY_SIMPLEX,
+                0.45, (95, 95, 95), 1, cv2.LINE_AA)
+    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    return enc.tobytes() if ok else b""
 
 
 class Registro:
@@ -703,7 +734,7 @@ async function listar(){
   cams=await (await fetch('/api/cameras')).json();
   document.getElementById('grade').innerHTML=cams.map(c=>`
     <div class=cam id="c_${c.mid}" onclick="alterna('${c.mid}')">
-      <img id="i_${c.mid}" src="/quadro/${c.mid}.mjpg">
+      <img id="i_${c.mid}" src="/foto/${c.mid}.jpg">
       <div class=lb><b>${c.nome}</b><span class="tag off" id="t_${c.mid}">DESLIGADA</span></div>
     </div>`).join('');
 }
@@ -715,8 +746,7 @@ async function alterna(mid){
     const tg=document.getElementById('t_'+c.mid);
     tg.textContent=on?'ANALISANDO':'DESLIGADA';
     tg.className='tag '+(on?'on':'off');
-    // recarrega o mjpeg: a camera desligada volta a mostrar a foto parada
-    document.getElementById('i_'+c.mid).src='/quadro/'+c.mid+'.mjpg?'+Date.now();
+    pinta(c.mid);   // atualiza ja, sem esperar o proximo tique
   });
 }
 function cor(v,a,b){return v<a?'ok':v<b?'warn':'bad'}
@@ -761,6 +791,16 @@ setInterval(async()=>{
    <tr><td>throttling</td><td>${s.throttled}</td></tr>
    <tr><td>tempo ligado</td><td>${dur(s.uptime)}</td></tr>`;
 },1500);
+// Carrega fora da tela e so troca o src quando o quadro ja esta pronto:
+// atribuir direto no <img> visivel o apaga enquanto baixa, e a 1 fps isso
+// pisca. Se um GET falhar, o proximo tique conserta - e essa e a diferenca
+// para o multipart, que falhava uma vez e congelava para sempre.
+function pinta(mid){
+  const im=new Image();
+  im.onload=()=>{const el=document.getElementById('i_'+mid); if(el) el.src=im.src;};
+  im.src='/foto/'+mid+'.jpg?'+Date.now();
+}
+setInterval(()=>cams.forEach(c=>pinta(c.mid)),1000);
 listar();
 </script>"""
 
@@ -1006,6 +1046,26 @@ class H(BaseHTTPRequestHandler):
                              if cfgmod.Config.quadra_de(c.mid) == q]}
                 for q in sorted(d["quadras"])]
             return self._json(d)
+        if self.path.startswith("/foto/"):
+            # UM JPEG, requisicao curta. O painel poda a 1 fps por polling em
+            # vez de segurar um multipart aberto: a conexao passa por
+            # cloudflared -> paramiko -> sshd, e stream longo por esse caminho
+            # congela no primeiro soluco - sem o <img> jamais reconectar.
+            mid = self.path.split("/")[-1].split(".")[0]
+            c = H.cams.get(mid)
+            if not c:
+                return self._json({"erro": "camera desconhecida"})
+            j = c.saida
+            if j is None:
+                j = _marcador(c.mid, c.larg, c.alt)
+                threading.Thread(target=c.foto, daemon=True).start()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(j)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(j)
+            return
         if self.path.startswith("/quadro/"):
             mid = self.path.split("/")[-1].split(".")[0]
             c = H.cams.get(mid)
@@ -1017,14 +1077,33 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             try:
-                ultimo = None
+                ultimo, marca, t_ult = None, None, 0.0
                 while True:
                     j = c.saida
-                    if j is not None and j is not ultimo:
+                    if j is None:
+                        # NUNCA deixe o <img> sem primeiro quadro: sem
+                        # bytes o navegador pinta um retangulo PRETO, e
+                        # nao da para distinguir camera escura de
+                        # miniatura que falhou.
+                        if marca is None:
+                            marca = _marcador(c.mid, c.larg, c.alt)
+                            # o painel aberto conserta o proprio tile
+                            threading.Thread(target=c.foto,
+                                             daemon=True).start()
+                        j = marca
+                    # REENVIA mesmo sem mudanca. No multipart o navegador
+                    # so pinta uma parte quando chega o delimitador da
+                    # SEGUINTE. Camera ativa manda ~1 quadro/s e fecha a
+                    # anterior sozinha; camera parada mandava uma parte e
+                    # calava - a imagem ficava presa no buffer e o tile
+                    # aparecia PRETO, com o JPEG certo do lado do servidor.
+                    agora = time.time()
+                    if j is not None and (j is not ultimo
+                                          or agora - t_ult > 2.0):
                         self.wfile.write(b"--q\r\nContent-Type: image/jpeg\r\n"
                                          b"Content-Length: " + str(len(j)).encode()
                                          + b"\r\n\r\n" + j + b"\r\n")
-                        ultimo = j
+                        ultimo, t_ult = j, agora
                     time.sleep(0.3)
             except Exception:
                 pass
