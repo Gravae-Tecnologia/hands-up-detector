@@ -34,8 +34,11 @@ import numpy as np
 DIR = os.path.dirname(os.path.abspath(__file__))
 MODELOS = os.environ.get("MODELOS", os.path.join(DIR, "modelos"))
 
+# `entrada` e (altura, largura), e o nome do arquivo segue o mesmo padrao.
+# `retrato` e a variante em pe, OPCIONAL - ver `Detector`.
 DETECTORES = {
-    "yolo11n-256": dict(arq="yolo11n_256x416.onnx", entrada=(256, 416), thr=0.25),
+    "yolo11n-256": dict(arq="yolo11n_256x416.onnx", entrada=(256, 416), thr=0.25,
+                        retrato=dict(arq="yolo11n_416x256.onnx", entrada=(416, 256))),
     "yolo11n-224": dict(arq="yolo11n_224x352.onnx", entrada=(224, 352), thr=0.25),
     "yolo11n-256-int8": dict(arq="yolo11n_256x416_int8.onnx", entrada=(256, 416), thr=0.25),
 }
@@ -94,24 +97,51 @@ def nms(caixas, scores, thr=0.45):
 
 
 class Detector:
+    """YOLO com a entrada escolhida PELA ORIENTACAO DO QUADRO.
+
+    O ONNX tem entrada fixa e o letterbox preserva a proporcao, entao a
+    geometria sai certa em qualquer caso. O que a orientacao muda e o
+    APROVEITAMENTO: quadro em pe (camera em modo "story", 9:16) numa entrada
+    deitada 416x256 ocupa ~37% da largura, e a pessoa do fundo chega pequena.
+    Na variante em pe (256x416) o mesmo quadro ocupa ~90%.
+
+    A variante em pe e OPCIONAL: sem o arquivo, todo quadro usa a deitada -
+    o comportamento anterior. O mesmo desenho do `nuvem/motor.py`.
+    """
+
     def __init__(self, nome, threads=2):
         cfg = DETECTORES[nome]
-        self.h, self.w = cfg["entrada"]
         self.thr = cfg["thr"]
-        self.s = sessao(os.path.join(MODELOS, cfg["arq"]), threads)
-        self.ent = self.s.get_inputs()[0].name
-        self.sai = [o.name for o in self.s.get_outputs()]
+        self.variantes = {"paisagem": self._carrega(cfg["arq"], cfg["entrada"], threads)}
+        em_pe = cfg.get("retrato")
+        if em_pe and os.path.exists(os.path.join(MODELOS, em_pe["arq"])):
+            self.variantes["retrato"] = self._carrega(em_pe["arq"], em_pe["entrada"],
+                                                      threads)
+        # quem lia det.h / det.w continua vendo a entrada deitada
+        self.h, self.w = cfg["entrada"]
+
+    @staticmethod
+    def _carrega(arq, entrada, threads):
+        s = sessao(os.path.join(MODELOS, arq), threads)
+        return {"s": s, "h": entrada[0], "w": entrada[1],
+                "ent": s.get_inputs()[0].name,
+                "sai": [o.name for o in s.get_outputs()]}
+
+    def orientacao(self, h, w):
+        """Qual variante um quadro h x w usa."""
+        return "retrato" if h > w and "retrato" in self.variantes else "paisagem"
 
     def __call__(self, bgr):
         h, w = bgr.shape[:2]
-        r = min(self.h / h, self.w / w)
+        v = self.variantes[self.orientacao(h, w)]
+        r = min(v["h"] / h, v["w"] / w)
         nw, nh = int(w * r), int(h * r)
-        tela = np.full((self.h, self.w, 3), 114, np.uint8)
+        tela = np.full((v["h"], v["w"], 3), 114, np.uint8)
         tela[:nh, :nw] = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(tela, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         blob = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
 
-        pred = self.s.run(self.sai, {self.ent: blob})[0][0].T   # (A, 4+nc)
+        pred = v["s"].run(v["sai"], {v["ent"]: blob})[0][0].T   # (A, 4+nc)
         conf = pred[:, 4]                                       # classe 0 = pessoa
         fica = conf > self.thr
         if not fica.any():

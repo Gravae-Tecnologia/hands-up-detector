@@ -36,6 +36,7 @@ import json
 import os
 import http.client
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -103,21 +104,126 @@ def throttled():
         return "?"
 
 
+# ---------------------------------------------------------------- geometria
+#: Teto do lado maior do quadro de analise. O substream das cameras em pe da
+#: CTF Marcelinho e 480x704 e passa inteiro; o teto so atua em camera cujo
+#: substream seja grande, para o JPEG enviado a nuvem nao crescer sem limite.
+LADO_MAX = 720
+
+
+def url_substream(url):
+    """URL do substream da MESMA camera, ou None se o padrao nao for conhecido.
+
+    Por que ler o substream: o stream principal das cameras em pe e 1440x2560
+    H.264 a 30 fps, e o ffmpeg decodifica TODOS os quadros para aproveitar 1
+    por segundo. Medido na CTF Marcelinho (Pi 4), a 1 fps: 61% de um nucleo
+    por camera no principal, 10% no substream (480x704 H.265). Com tres
+    cameras, ~183% contra ~30% - e foi o principal que levou a Pi a 81,8 C.
+
+    Padroes: Intelbras/Dahua (`subtype=0` -> `subtype=1`) e Hikvision
+    (`/Streaming/Channels/101` -> `102`). Fora deles, fica no principal.
+    """
+    if re.search(r"subtype=0\b", url):
+        return re.sub(r"subtype=0\b", "subtype=1", url)
+    m = re.search(r"(/Streaming/Channels/\d+?)01\b", url, re.I)
+    if m:
+        return url[:m.start()] + m.group(1) + "02" + url[m.end():]
+    return None
+
+
+def url_principal(url):
+    """URL do stream PRINCIPAL, mesmo que o Shinobi esteja cadastrado no
+    substream. E do principal que sai a proporcao verdadeira da cena - o
+    substream pode ser anamorfico. None se o padrao nao for conhecido."""
+    if re.search(r"subtype=\d+\b", url):
+        return re.sub(r"subtype=\d+\b", "subtype=0", url)
+    m = re.search(r"(/Streaming/Channels/\d+?)0\d\b", url, re.I)
+    if m:
+        return url[:m.start()] + m.group(1) + "01" + url[m.end():]
+    return None
+
+
+def sonda(url, timeout=20):
+    """(largura, altura) exibidas do video, ou None se nao respondeu.
+
+    So metadado, nao decodifica quadro. Considera rotacao declarada: o ffmpeg
+    gira o quadro sozinho ao decodificar, entao as dimensoes que valem sao as
+    ja giradas.
+    """
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=width,height:stream_side_data=rotation",
+             "-of", "json", url],
+            capture_output=True, timeout=timeout)
+        s = (json.loads(p.stdout or b"{}").get("streams") or [None])[0]
+        if not s:
+            return None
+        w, h = int(s.get("width") or 0), int(s.get("height") or 0)
+        for sd in s.get("side_data_list") or []:
+            if abs(int(sd.get("rotation", 0))) % 180 == 90:
+                w, h = h, w
+        return (w, h) if w > 0 and h > 0 else None
+    except Exception:
+        return None
+
+
+def dimensoes_analise(real, nativo, lado_max=LADO_MAX):
+    """Tamanho do quadro de analise: a PROPORCAO da cena com os PIXELS do
+    stream que vamos ler, sem nunca aumentar resolucao.
+
+    `real`    (w, h) do stream principal - e dele a proporcao verdadeira.
+    `nativo`  (w, h) do stream lido, que pode ser ANAMORFICO. Na CTF o
+              substream e 480x704 para uma cena 9:16: os pixels vem esticados
+              21% na horizontal, e a camera NAO declara isso
+              (sample_aspect_ratio=N/A). Usar os pixels crus deixaria cada
+              pessoa 21% mais larga - e o gesto e medido em larguras de ombro.
+
+    Devolve o maior retangulo com a proporcao real que cabe nos pixels
+    nativos, limitado a `lado_max`, com lados pares. 1440x2560 lido pelo
+    substream 480x704 vira 396x704: a altura nativa inteira, a largura
+    corrigida.
+    """
+    ar = real[0] / real[1]
+    w, h = float(nativo[0]), float(nativo[1])
+    if w / h > ar:
+        w = h * ar          # nativo mais "largo" que a cena: estreita
+    else:
+        h = w / ar          # mais "alto": encurta
+    f = min(1.0, lado_max / max(w, h))
+    par = lambda v: max(2, int(round(v * f / 2)) * 2)
+    return par(w), par(h)
+
+
 class Camera:
     """Captura 1 fps de uma camera e guarda SO o quadro mais recente.
 
-    A captura so existe enquanto a camera esta LIGADA. Cada ffmpeg custava
-    ~27% de um nucleo (o stream principal e 1280x720@30 e o `-vf fps=1`
-    descarta DEPOIS de decodificar), entao manter quatro rodando gastava
-    ~110% de CPU com tres cameras que ninguem estava olhando - e a Pi ja
-    chegou a 84,7 C com throttling ativo por causa disso.
+    A captura so existe enquanto a camera esta LIGADA: o `-vf fps=1` descarta
+    DEPOIS de decodificar, entao cada ffmpeg paga o stream inteiro. Com o
+    principal a 1280x720 eram ~27% de um nucleo por camera; com as cameras em
+    pe a 1440x2560, 61%. Por isso a captura le o SUBSTREAM (10%).
+
+    GEOMETRIA VEM DA CAMERA, NAO DE CONSTANTE. Ate aqui o quadro era sempre
+    esticado para 640x400. Quando as cameras viraram para o modo "story"
+    (9:16), cada pessoa passou a chegar achatada ~2,8x na vertical - e o
+    criterio do gesto e vertical (punho acima do ombro em larguras de ombro).
+    Foi o que parou a deteccao. Agora a proporcao sai do stream principal e os
+    pixels do substream, ver `_geometria`, e isso e refeito a cada conexao:
+    se virarem a camera de novo, a proxima reconexao ja pega.
 
     Para a grade continuar util sem custo, cada camera guarda uma FOTO tirada
     uma vez so no arranque.
     """
 
-    def __init__(self, cam, larg, alt, fps=1.0):
-        self.cam, self.larg, self.alt, self.fps = cam, larg, alt, fps
+    def __init__(self, cam, lado_max=LADO_MAX, fps=1.0, substream=True):
+        self.cam, self.fps = cam, fps
+        self.lado_max, self.usa_sub = lado_max, substream
+        # decididos por `_geometria` a partir da propria camera
+        self.fonte = None           # URL que o ffmpeg le
+        self.larg = self.alt = None # quadro de analise, na proporcao real
+        self.geo = {}               # o que foi medido, para o /api/stats
+        self.lock_geo = threading.Lock()
         self.mid = cam["mid"]
         self.lock = threading.Lock()
         self.quadro = None          # ultimo quadro cru
@@ -141,6 +247,39 @@ class Camera:
         self.thread = None
         threading.Thread(target=self.foto, daemon=True).start()
 
+    def _geometria(self):
+        """De onde ler e em que tamanho, medido na camera. True se ha
+        geometria valida (nova, ou a ultima conhecida se a sonda falhou).
+
+        A proporcao verdadeira so vem do stream PRINCIPAL: o substream pode
+        ser anamorfico e nao declara (ver `dimensoes_analise`). A sonda e so
+        metadado - uma conexao curta, sem decodificar.
+        """
+        with self.lock_geo:
+            principal = url_principal(self.cam["rtsp"]) or self.cam["rtsp"]
+            real = sonda(principal)
+            if real is None:
+                self.erro = "stream principal nao respondeu a sonda"
+                return self.larg is not None      # segue com a ultima conhecida
+            fonte, nativo = principal, real
+            sub = url_substream(principal) if self.usa_sub else None
+            if sub:
+                ns = sonda(sub)
+                if ns:
+                    fonte, nativo = sub, ns
+            w, h = dimensoes_analise(real, nativo, self.lado_max)
+            self.fonte, self.larg, self.alt = fonte, w, h
+            self.geo = {"fonte": "substream" if fonte != principal else "principal",
+                        "real": list(real), "nativo": list(nativo),
+                        "analise": [w, h],
+                        "orientacao": "retrato" if h > w else "paisagem"}
+            return True
+
+    def dims(self):
+        """(largura, altura) do quadro de analise; antes da primeira sonda,
+        um tamanho neutro so para o marcador cinza do painel."""
+        return (self.larg or 640, self.alt or 360)
+
     def foto(self, tentativas=3):
         """Um quadro so, para a miniatura. Custa um ffmpeg de ~2 s e acabou.
 
@@ -157,19 +296,25 @@ class Camera:
         e como ela leva ate 40 s, isso acontece toda vez que o servico sobe
         com camera ja ligada. Agora so nao sobrescreve quadro ANOTADO: se a
         miniatura ainda e None, vale mesmo com a camera ligada.
+
+        Sai do substream, como a captura: alem de barato, e outra sessao que
+        nao o principal que o Shinobi ja segura.
         """
-        n = self.larg * self.alt * 3
         for _t in range(tentativas):
           try:
+            if not self._geometria():
+                time.sleep(3 * (_t + 1))
+                continue
+            w, h, fonte = self.larg, self.alt, self.fonte
+            n = w * h * 3
             p = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-rtsp_transport", "tcp", "-i", self.cam["rtsp"],
-                 "-frames:v", "1", "-vf", f"scale={self.larg}:{self.alt}",
+                 "-rtsp_transport", "tcp", "-i", fonte,
+                 "-frames:v", "1", "-vf", f"scale={w}:{h}",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                 capture_output=True, timeout=40)
             if len(p.stdout) >= n:
-                img = np.frombuffer(p.stdout[:n], np.uint8).reshape(
-                    self.alt, self.larg, 3)
+                img = np.frombuffer(p.stdout[:n], np.uint8).reshape(h, w, 3)
                 ok, enc = cv2.imencode(".jpg", img,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                 if ok and (not self.ativa or self.saida is None):
@@ -214,12 +359,18 @@ class Camera:
         threading.Thread(target=self.foto, daemon=True).start()
 
     def _captura(self):
-        n = self.larg * self.alt * 3
         while not self.parar.is_set():
+            # Geometria medida A CADA conexao, nao uma vez so: e na reconexao
+            # que uma camera virada de orientacao aparece.
+            if not self._geometria():
+                self.parar.wait(10)
+                continue
+            w, h, fonte = self.larg, self.alt, self.fonte
+            n = w * h * 3
             p = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-rtsp_transport", "tcp", "-i", self.cam["rtsp"],
-                 "-vf", f"fps={self.fps},scale={self.larg}:{self.alt}",
+                 "-rtsp_transport", "tcp", "-i", fonte,
+                 "-vf", f"fps={self.fps},scale={w}:{h}",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=n * 3)
             try:
@@ -229,8 +380,7 @@ class Camera:
                         self.erro = (p.stderr.read(200).decode("utf-8", "replace")
                                      .strip()[:120] or "stream caiu")
                         break
-                    img = np.frombuffer(buf, np.uint8).reshape(
-                        self.alt, self.larg, 3).copy()
+                    img = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
                     self.m["capturados"] += 1
                     self.erro = None
                     if self.cron is not None:
@@ -701,7 +851,7 @@ h1{font-size:18px;margin:0 0 4px;font-weight:600}
 .cam{background:#12151c;border:2px solid #1e222b;border-radius:10px;overflow:hidden;cursor:pointer;transition:.15s}
 .cam:hover{border-color:#4a4f5e}
 .cam.on{border-color:#7c5cff;box-shadow:0 0 0 3px rgba(124,92,255,.14)}
-.cam img{width:100%;display:block;aspect-ratio:16/10;object-fit:cover;background:#000}
+.cam img{width:100%;display:block;max-height:70vh;object-fit:contain;background:#000}
 .cam .lb{padding:8px 10px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
 .tag{font-size:11px;font-weight:700;letter-spacing:.4px}
 .tag.on{color:#7c5cff}.tag.off{color:#5a6072}
@@ -1057,7 +1207,7 @@ class H(BaseHTTPRequestHandler):
                 return self._json({"erro": "camera desconhecida"})
             j = c.saida
             if j is None:
-                j = _marcador(c.mid, c.larg, c.alt)
+                j = _marcador(c.mid, *c.dims())
                 threading.Thread(target=c.foto, daemon=True).start()
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -1086,7 +1236,7 @@ class H(BaseHTTPRequestHandler):
                         # nao da para distinguir camera escura de
                         # miniatura que falhou.
                         if marca is None:
-                            marca = _marcador(c.mid, c.larg, c.alt)
+                            marca = _marcador(c.mid, *c.dims())
                             # o painel aberto conserta o proprio tile
                             threading.Thread(target=c.foto,
                                              daemon=True).start()
@@ -1181,6 +1331,9 @@ def estatisticas():
             "alerta": (time.time() - m["ultimo_gesto"]) < 8,
             "ocupacao": (m["ms"] / 10.0) if c.ativa else 0.0,
             "erro": c.erro,
+            # de onde le e em que tamanho: fonte (substream/principal), real
+            # (proporcao da cena), nativo (pixels lidos), analise (enviado)
+            "geometria": c.geo,
         })
         if c.ativa:
             cap_tot += m["capturados"]
@@ -1232,8 +1385,15 @@ def main():
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--max-pessoas", type=int, default=0, dest="max_pessoas")
-    ap.add_argument("--largura", type=int, default=640)
-    ap.add_argument("--altura", type=int, default=400)
+    # Tamanho do quadro agora sai da propria camera (ver Camera._geometria).
+    # --largura/--altura ficam aceitos para nao quebrar unit antiga que os
+    # passe, mas nao fazem mais nada: eram eles que esticavam tudo para 16:10.
+    ap.add_argument("--largura", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--altura", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--lado-max", type=int, default=LADO_MAX, dest="lado_max",
+                    help="teto do lado maior do quadro de analise")
+    ap.add_argument("--sem-substream", action="store_true", dest="sem_substream",
+                    help="le o stream principal (so para comparar; custa ~6x CPU)")
     ap.add_argument("--fps", type=float, default=1.0)
     ap.add_argument("--nuvem", default="",
                     help="URL do endpoint remoto; vazio = inferencia local")
@@ -1261,12 +1421,16 @@ def main():
         args.webhook = H.conf.d["webhook"]
     args.fps = H.conf.d.get("fps", args.fps)
     args.qualidade = H.conf.d.get("qualidade", args.qualidade)
+    # substream ligado por padrao; `"substream": false` na config desliga
+    usa_sub = not args.sem_substream and bool(H.conf.d.get("substream", True))
     H.cfg["dur_gesto"] = H.conf.d.get("dur_gesto", 2.0)
     for k, padrao in (("em_voo_max", 4), ("em_voo_min", 1), ("ajuste_s", 10.0)):
         H.cfg[k] = H.conf.d.get(k, padrao)
     sel = todas
     print(f"{len(sel)} cameras | ativo={H.conf.d['ativo']} | "
-          f"config={H.conf.caminho}", flush=True)
+          f"config={H.conf.caminho} | "
+          f"captura: {'substream' if usa_sub else 'principal'}, proporcao da "
+          f"camera, lado <= {args.lado_max}", flush=True)
 
     dev = {}
     try:
@@ -1310,7 +1474,7 @@ def main():
                   f"as cameras vao acumular falhas", flush=True)
         H.pool = None
         for c in sel:
-            cam = Camera(c, args.largura, args.altura, args.fps)
+            cam = Camera(c, args.lado_max, args.fps, substream=usa_sub)
             cam.nuvem = Nuvem(args.nuvem, args.qualidade,
                               arena=dev.get("shinobiGroupKey", ""),
                               camera=c["mid"])
@@ -1322,7 +1486,7 @@ def main():
         print(f"pool: {args.workers} worker(s) x {args.threads} thread(s) | "
               f"{H.pool.nome} | RAM ~{args.workers * 200} MB", flush=True)
         for c in sel:
-            H.cams[c["mid"]] = Camera(c, args.largura, args.altura, args.fps)
+            H.cams[c["mid"]] = Camera(c, args.lado_max, args.fps, substream=usa_sub)
 
         def despachante():
             while True:
