@@ -23,6 +23,12 @@ DESCARTA QUADRO VELHO, NAO ENFILEIRA
     porque descarte silencioso vira "funciona" na demo e "nao pegou o gesto"
     em producao.
 
+SO COM GENTE EM QUADRA (gatilho "ia")
+    Com `"gatilho": "ia"` na config, uma camera ligada so captura enquanto ha
+    gente: a IA da propria camera avisa, e a captura pausa `espera_ia_s`
+    depois da ultima pessoa vista. A regra inteira esta em `ia_camera.py`;
+    aqui so se aplica, em `aplica_config`, a cada segundo.
+
   GET /                    grade + debug
   GET /api/cameras         monitores (do MariaDB, ver `cameras()`)
   GET /quadro/<mid>.mjpg   stream da camera (anotado se selecionada)
@@ -48,6 +54,7 @@ import numpy as np
 
 import config as cfgmod
 import cronologia as cronmod
+import ia_camera as iamod
 import motor
 import rastreio as rastmod
 import revisao as revmod
@@ -84,6 +91,9 @@ def cameras():
             "mid": mid, "nome": nome or mid, "status": modo,
             "res": f"{larg}x{alt}",
             "rtsp": f"rtsp://{cred}{host}:{porta}/{caminho.lstrip('/')}",
+            # separados para a API HTTP da camera (IA de humano); a mesma
+            # credencial do RTSP. Nunca saem pela API do servico.
+            "host": host, "usuario": usr, "senha": pwd,
         })
     return saida
 
@@ -245,7 +255,91 @@ class Camera:
         self.rast = rastmod.Rastreador(dur_s=H.cfg.get("dur_gesto", 2.0))
         self.parar = threading.Event()
         self.thread = None
+        # gatilho pela IA da camera (ver ia_camera.py e aplica_config)
+        self.ia = None              # o que a camera oferece, perguntado a ela
+        self.sondando = False
+        self.vigia = None           # conexao de eventos: so no gatilho "ia"
+        self.presenca = None
+        self.modo = "desligada"     # um de iamod.MODOS
+        self.local = None           # clique no painel local forca liga/desliga
+        self.tempo = {"ativa": 0.0, "pausada": 0.0}   # so conta no gatilho "ia"
         threading.Thread(target=self.foto, daemon=True).start()
+        # Sonda JA no arranque, com tudo desligado: e o que deixa o OPS mostrar
+        # quais cameras tem IA antes de o operador escolher o gatilho.
+        self.sonda_ia()
+
+    # ---------------------------------------------------------- gatilho IA
+    def sonda_ia(self):
+        """Pergunta a camera, em segundo plano, se ela tem IA de humano."""
+        if self.sondando:
+            return False
+        self.sondando = True
+
+        def roda():
+            try:
+                self.ia = iamod.sonda(self.cam.get("host"),
+                                      self.cam.get("usuario", ""),
+                                      self.cam.get("senha", ""))
+            except Exception as e:     # a sonda nao levanta; isto e seguro
+                self.ia = {"suporta": None, "ligada": None,
+                           "motivo": f"sonda falhou: {type(e).__name__}",
+                           "sondado_em": round(time.time(), 1)}
+            finally:
+                self.sondando = False
+        threading.Thread(target=roda, daemon=True).start()
+        return True
+
+    def resonda_se_preciso(self, agora):
+        ia = self.ia
+        if ia is None:
+            return                     # a do arranque ainda esta rodando
+        prazo = (iamod.RESONDA_FALHA_S if ia.get("suporta") is None
+                 else iamod.RESONDA_OK_S)
+        if agora - ia.get("sondado_em", 0) > prazo:
+            self.sonda_ia()
+
+    def ouve(self, espera_s):
+        """Abre a conexao de eventos com a camera. Presenca NOVA a cada vez:
+        nasce com o prazo cheio, porque ninguem sabe o que houve enquanto
+        ninguem ouvia."""
+        if self.vigia is not None:
+            return
+        self.presenca = iamod.Presenca(espera_s)
+        self.vigia = iamod.Vigia(self.mid, self.cam.get("host"),
+                                 self.cam.get("usuario", ""),
+                                 self.cam.get("senha", ""),
+                                 self.presenca).inicia()
+
+    def nao_ouve(self):
+        if self.vigia is None:
+            return
+        self.vigia.para()
+        self.vigia = self.presenca = None
+
+    def muda_modo(self, novo, agora):
+        antigo, self.modo = self.modo, novo
+        est = self.presenca.estado(agora) if self.presenca else None
+        print(f"{self.mid}: {antigo} -> {novo}"
+              + (f" (pessoa ha {est['ha_s']} s)" if est and est["ha_s"] is not None
+                 else ""), flush=True)
+        if H.registro:
+            H.registro.escreve(cam=self.mid, evento="gatilho", de=antigo,
+                               para=novo, presenca=est)
+
+    def resumo_gatilho(self, agora):
+        """O que o OPS precisa para desenhar esta camera no modo hands-up."""
+        at, pa = self.tempo["ativa"], self.tempo["pausada"]
+        return {
+            "modo": self.modo,
+            "ia": self.ia,
+            "ia_usavel": iamod.usavel(self.ia),
+            "presenca": self.presenca.estado(agora) if self.presenca else None,
+            "evento_erro": self.vigia.erro if self.vigia else None,
+            # desde que o servico subiu, so enquanto o gatilho era "ia"
+            "gatilho_ia_s": {"ativa": round(at), "pausada": round(pa),
+                             "pct_pausada": round(100 * pa / (at + pa), 1)
+                             if at + pa > 0 else None},
+        }
 
     def _geometria(self):
         """De onde ler e em que tamanho, medido na camera. True se ha
@@ -447,6 +541,12 @@ class Camera:
         self.erro = None
         kpts = [np.array(k, np.float32) for k in r.get("kpts", [])]
         caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
+        # Gente vista pelo detector tambem segura o gatilho "ia": a camera so
+        # avisa MOVIMENTO humano, e quem esta parado conversando entre dois
+        # games nao gera evento. O relogio e a captura (invariante 4).
+        pres = self.presenca
+        if pres is not None and (len(caixas) or kpts):
+            pres.viu(t_cap, "detector")
         # margem continua por pessoa: e o que permite recalibrar o limiar
         # depois sem recapturar nada
         margens = [motor.gesto_margem(k) for k in kpts]
@@ -900,6 +1000,16 @@ async function alterna(mid){
   });
 }
 function cor(v,a,b){return v<a?'ok':v<b?'warn':'bad'}
+// gatilho de cada camera: modo + ha quanto tempo a ultima pessoa foi vista
+function rotulo(g){
+  if(!g) return '';
+  const p=g.presenca;
+  let t=g.modo+(g.ia_usavel?' &middot; IA':'');
+  if(p&&p.ha_s!=null) t+=' &middot; pessoa ha '+dur(p.ha_s);
+  if(g.modo==='gente'&&p&&!p.em_curso) t+=' &middot; pausa em '+dur(p.restante_s);
+  if(g.modo==='gente'&&p&&p.em_curso) t+=' &middot; em movimento';
+  return t;
+}
 function dur(s){
   if(s<60) return s.toFixed(0)+' s';
   if(s<3600) return (s/60).toFixed(1)+' min';
@@ -907,14 +1017,23 @@ function dur(s){
 }
 setInterval(async()=>{
   const s=await (await fetch('/api/stats')).json();
+  // o estado muda sozinho no gatilho "ia": o tile acompanha, nao so o clique
+  s.cameras.forEach(c=>{
+    const tg=document.getElementById('t_'+c.mid); if(!tg) return;
+    const m=(c.gatilho||{}).modo;
+    tg.textContent=c.ativa?'ANALISANDO':(m==='pausada'?'PAUSADA - SEM GENTE':'DESLIGADA');
+    tg.className='tag '+(c.ativa?'on':'off');
+    document.getElementById('c_'+c.mid).classList.toggle('on',c.ativa);
+  });
   document.getElementById('tab').innerHTML=`<tr>
-    <th>camera</th><th class=n>capt</th><th class=n>proc</th>
+    <th>camera</th><th>gatilho: ${s.gatilho}</th><th class=n>capt</th><th class=n>proc</th>
     <th class=n>desc</th><th class=n>falhas</th><th class=n>pessoas</th>
     <th class=n>GESTOS</th><th class=n>total ms</th><th class=n>p90</th>
     <th class=n>${s.nuvem?'encode':'det'}</th><th class=n>${s.nuvem?'rede':'pose'}</th>
     <th class=n>${s.nuvem?'servidor':'ocup'}</th><th class=n>${s.nuvem?'KB':''}</th></tr>`+
     s.cameras.map(c=>`<tr class="${c.alerta?'alerta':''}">
       <td>${c.ativa?'<b>'+c.nome+'</b>':c.nome}</td>
+      <td>${rotulo(c.gatilho)}</td>
       <td class=n>${c.capturados}</td><td class=n>${c.processados}</td>
       <td class="n ${c.descartados>0?'warn':''}">${c.descartados}</td>
       <td class="n ${c.falhas>0?'bad':''}">${c.falhas}</td>
@@ -926,7 +1045,7 @@ setInterval(async()=>{
       <td class="n ${cor(c.ocupacao,70,100)}">${s.nuvem?(c.ms_det+c.ms_pose).toFixed(0):c.ocupacao.toFixed(0)+'%'}</td>
       <td class=n>${s.nuvem?c.kb.toFixed(0):''}</td>
     </tr>`).join('')+
-    s.cameras.filter(c=>c.erro).map(c=>`<tr><td colspan=11 class=err>${c.nome}: ${c.erro}</td></tr>`).join('');
+    s.cameras.filter(c=>c.erro).map(c=>`<tr><td colspan=14 class=err>${c.nome}: ${c.erro}</td></tr>`).join('');
 
   document.getElementById('sis').innerHTML=`
    <tr><td>pipeline</td><td><b>${s.pipeline}</b> &middot; ${s.workers} worker(s) x ${s.threads} thread(s)</td></tr>
@@ -955,19 +1074,77 @@ listar();
 </script>"""
 
 
-def aplica_config():
-    """Liga e desliga cameras conforme a config. Idempotente de proposito: o
-    OPS pode chamar quantas vezes quiser sem efeito colateral."""
-    ligadas = []
-    for mid, c in H.cams.items():
-        quer = H.conf.ligada(mid)
-        if quer and not c.ativa:
-            c.liga()
-        elif not quer and c.ativa:
-            c.desliga()
-        if quer:
-            ligadas.append(mid)
-    return ligadas
+_lock_aplica = threading.Lock()
+_t_aplica = [0.0]
+
+
+def aplica_config(espera_lock=None):
+    """Liga e desliga a captura de cada camera: chaves do OPS + gatilho.
+
+    Roda a cada mudanca de config E a cada segundo (`ciclo_gatilho`): no
+    gatilho "ia" o estado muda sem ninguem mexer na config - a camera avisa
+    que chegou gente, ou o prazo vence. Idempotente de proposito: o OPS pode
+    chamar quantas vezes quiser sem efeito colateral.
+
+    Devolve as cameras capturando agora. Com gatilho "ia", camera ligada e
+    pausada NAO entra - `modo` diz o porque.
+
+    `liga`/`desliga` rodam DENTRO do lock de proposito: um `liga` no meio de
+    um `desliga` da mesma camera pararia a Cronologia nova. O preco e que um
+    `desliga` pode segurar o lock por segundos (join das threads de envio), e
+    o agente so espera 8 s pela resposta. Por isso quem vem do OPS passa
+    `espera_lock`: se nao conseguir o lock a tempo, devolve None sem aplicar -
+    a config ja esta gravada e o laco aplica no segundo seguinte.
+    """
+    if not _lock_aplica.acquire(timeout=-1 if espera_lock is None else espera_lock):
+        return None
+    try:
+        agora = time.time()
+        # teto de 5 s: um `desliga` que segurou o laco nao vira buraco na conta
+        dt = min(agora - _t_aplica[0], 5.0) if _t_aplica[0] else 0.0
+        _t_aplica[0] = agora
+        gatilho = H.conf.d.get("gatilho", "manual")
+        espera = H.conf.d.get("espera_ia_s", iamod.ESPERA_S)
+        ligadas = []
+        for mid, c in H.cams.items():
+            ligada = H.conf.ligada(mid)
+            c.resonda_se_preciso(agora)
+            # a conexao de eventos so existe quando alguem vai ouvi-la
+            if ligada and gatilho == "ia" and iamod.usavel(c.ia):
+                c.ouve(espera)
+            else:
+                c.nao_ouve()
+            if c.presenca is not None:
+                c.presenca.espera_s = espera
+            quer, modo = iamod.decide(ligada, gatilho, c.ia, c.presenca, agora)
+            if c.local is not None:
+                quer, modo = c.local, "forcada"
+            if modo != c.modo:
+                c.muda_modo(modo, agora)
+            if modo in ("gente", "sem_sinal"):
+                c.tempo["ativa"] += dt
+            elif modo == "pausada":
+                c.tempo["pausada"] += dt
+            if quer and not c.ativa:
+                c.liga()
+            elif not quer and c.ativa:
+                c.desliga()
+            if c.ativa:
+                ligadas.append(mid)
+        return ligadas
+    finally:
+        _lock_aplica.release()
+
+
+def ciclo_gatilho():
+    """Reavalia o gatilho a cada segundo. Sem isto, uma camera pausada so
+    voltaria quando alguem mexesse na config."""
+    while True:
+        time.sleep(1)
+        try:
+            aplica_config()
+        except Exception as e:      # o laco nao pode morrer calado
+            print(f"gatilho: {type(e).__name__}: {e}", flush=True)
 
 
 PAGINA_REVISAO = """<!doctype html><meta charset=utf-8><title>Revisao de gestos</title>
@@ -1139,9 +1316,9 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def _json(self, obj):
+    def _json(self, obj, status=200):
         b = json.dumps(obj).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b)))
         self.end_headers()
@@ -1184,17 +1361,31 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/api/alertas"):
             return self._json(list(reversed(H.alertas[-40:])))
         if self.path.startswith("/api/config"):
-            # o OPS le isto para desenhar os switches
+            # o OPS le isto para desenhar os switches (o agente repassa inteiro)
+            agora = time.time()
             d = dict(H.conf.d)
             d["arena"] = H.cfg.get("arena", "")
             d["quadras_detalhe"] = [
                 {"quadra": q,
                  "ligada": bool(d["quadras"].get(q)),
-                 "cameras": [{"mid": c.mid, "ligada": bool(d["cameras"].get(c.mid)),
-                              "processando": c.ativa}
+                 "cameras": [dict({"mid": c.mid,
+                                   "ligada": bool(d["cameras"].get(c.mid)),
+                                   "processando": c.ativa},
+                                  **c.resumo_gatilho(agora))
                              for c in H.cams.values()
                              if cfgmod.Config.quadra_de(c.mid) == q]}
                 for q in sorted(d["quadras"])]
+            cams = list(H.cams.values())
+            # o que o painel precisa para oferecer o gatilho "ia": quantas
+            # cameras tem IA utilizavel, e se ainda falta resposta de alguma
+            d["ia_resumo"] = {
+                "cameras": len(cams),
+                "com_ia": sum(1 for c in cams if iamod.usavel(c.ia)),
+                "sem_resposta": sum(1 for c in cams
+                                    if c.ia is None or c.ia.get("suporta") is None),
+                "sondando": any(c.sondando for c in cams),
+            }
+            d["modos"] = iamod.MODOS
             return self._json(d)
         if self.path.startswith("/foto/"):
             # UM JPEG, requisicao curta. O painel poda a 1 fps por polling em
@@ -1275,35 +1466,53 @@ class H(BaseHTTPRequestHandler):
         if self.path.startswith("/api/config"):
             # chamada pelo OPS: {"ativo":true} | {"quadra":"campo01","valor":true}
             # | {"camera":"campo01_camera01","valor":false} | {"nuvem":"https://..."}
+            # | {"gatilho":"ia"} | {"espera_ia_s":600} | {"sondar_ia":true}
+            erro = cfgmod.Config.valida_gatilho(d)
+            if erro:
+                return self._json({"ok": False, "erro": erro}, 400)
             H.conf.define(**{k: v for k, v in d.items()
                              if k in ("ativo", "quadra", "camera", "valor",
                                       "nuvem", "webhook", "fps", "qualidade",
                                       "dur_gesto", "em_voo_max", "em_voo_min",
-                                      "ajuste_s")})
+                                      "ajuste_s", "gatilho", "espera_ia_s")})
             if "dur_gesto" in d:
                 # aplica nas cameras ja rodando, sem reiniciar o servico
                 H.cfg["dur_gesto"] = H.conf.d["dur_gesto"]
                 for c in H.cams.values():
                     c.rast.dur_s = H.cfg["dur_gesto"]
-            aplicada = aplica_config()
+            if d.get("sondar_ia"):
+                # "testar cameras" no painel. Responde na hora: com camera
+                # fora do ar a sonda leva ate 6 s por pergunta, e o agente so
+                # espera 8 s. O resultado aparece no proximo GET.
+                for c in H.cams.values():
+                    c.sonda_ia()
+            # quem manda e o OPS: qualquer config dele desfaz o clique local
+            for c in H.cams.values():
+                c.local = None
+            aplicada = aplica_config(espera_lock=2.0)
             return self._json({"ok": True, "config": H.conf.d,
-                               "processando": aplicada})
+                               "processando": aplicada if aplicada is not None
+                               else [m for m, c in H.cams.items() if c.ativa],
+                               # gravada; o laco aplica no proximo segundo
+                               "pendente": aplicada is None})
         c = H.cams.get(d.get("mid"))
         if not c:
             return self._json({"erro": "camera desconhecida"})
-        if c.ativa:
-            c.desliga()
-        elif H.cfg.get("nuvem"):
-            c.liga()          # sem exclusividade: a Pi so encoda e envia
-        else:
+        # Clique no painel local: forca, por cima das chaves e do gatilho, ate
+        # a proxima config do OPS. Passa por `aplica_config` como todo o resto
+        # - senao o laco do gatilho desfaria o clique no segundo seguinte.
+        quer = not c.ativa
+        if quer and not H.cfg.get("nuvem"):
             # foco exclusivo: so a camera clicada captura e infere. As outras
             # param o ffmpeg por completo - com quatro capturas simultaneas a
             # Pi chegou a 84,7 C e throttling ativo, gastando CPU com cameras
-            # que ninguem estava olhando.
+            # que ninguem estava olhando. (Em modo nuvem nao ha exclusividade:
+            # a Pi so encoda e envia.)
             for o in H.cams.values():
                 if o is not c:
-                    o.desliga()
-            c.liga()
+                    o.local = False
+        c.local = quer
+        aplica_config()
         return self._json({"ok": True, "mid": c.mid, "ativa": c.ativa,
                            "desligadas": [o.mid for o in H.cams.values()
                                           if not o.ativa]})
@@ -1334,6 +1543,7 @@ def estatisticas():
             # de onde le e em que tamanho: fonte (substream/principal), real
             # (proporcao da cena), nativo (pixels lidos), analise (enviado)
             "geometria": c.geo,
+            "gatilho": c.resumo_gatilho(time.time()),
         })
         if c.ativa:
             cap_tot += m["capturados"]
@@ -1359,6 +1569,7 @@ def estatisticas():
     atraso_h = (falta / max(demanda, 1e-9)) * 3600 if demanda else 0.0
     return {
         "cameras": linhas,
+        "gatilho": H.conf.d.get("gatilho", "manual"),
         "pipeline": (pool.nome if pool else f"NUVEM {cfg['nuvem']}"),
         "nuvem": nuvem, "workers": n_w, "threads": cfg["threads"],
         "ativas": ativas,
@@ -1496,8 +1707,9 @@ def main():
 
     H.cfg["arena"] = dev.get("shinobiGroupKey", "")
     ligadas = aplica_config()
-    print(f"processando agora: {ligadas or 'nenhuma (ligue pelo OPS)'}",
-          flush=True)
+    print(f"processando agora: {ligadas or 'nenhuma (ligue pelo OPS)'} | "
+          f"gatilho: {H.conf.d.get('gatilho', 'manual')}", flush=True)
+    threading.Thread(target=ciclo_gatilho, daemon=True).start()
     print(f"servico em http://0.0.0.0:{args.porta}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", args.porta), H).serve_forever()
 
