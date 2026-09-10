@@ -58,7 +58,16 @@ if [ -n "$NEED" ]; then
   # subia e morria em loop sem cv2. Foi a primeira instalacao no Fit Club,
   # 10/09/2026.
   sudo apt-get update -qq || echo "    aviso: apt-get update com erro (repositorio expirado?); seguindo com as listas que ha"
-  sudo apt-get install -y -q $NEED
+  if ! sudo apt-get install -y -q $NEED; then
+    # Mesma causa, segundo sintoma: as listas velhas do *-security ainda
+    # apontam para versoes que sairam do servidor (404 em libpq5 e
+    # libgdcm3.0, dependencias do opencv, no Fit Club). Mirando o repositorio
+    # principal da mesma versao, o apt escolhe o que ainda existe - simulado
+    # la antes: 62 pacotes novos, nenhum removido, nenhum rebaixado.
+    CODINOME=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    echo "    install falhou; tentando so o repositorio principal (-t $CODINOME)"
+    [ -n "$CODINOME" ] && sudo apt-get install -y -q -t "$CODINOME" $NEED
+  fi
 else
   echo "    ja instaladas"
 fi

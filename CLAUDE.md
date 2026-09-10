@@ -124,7 +124,7 @@ o que só ela mede.
 | esperar a câmera chamar a Pi | nenhum evento chega | as Intelbras do parque têm `SupportAlarmServer=false`: não fazem POST para fora. É a Pi que abre o `eventManager.cgi?action=attach` e fica ouvindo |
 | evento de humano "parou" com gente em quadra | pausa no meio do jogo | `SmartMotionHuman` é movimento; quem está parado não gera evento. O prazo de 10 min + as pessoas vistas pelo detector seguram |
 | linha do evento com `data={` | parser quebra no JSON | cada evento vem seguido de um JSON de várias linhas (hora, UTC, nome); só a linha `Code=` interessa |
-| `apt-get update` numa Pi com Debian 11 | instalador "passa", serviço morre em loop sem `cv2` | o bullseye saiu do LTS (31/08/2026) e o Release do `bullseye-security` expirou; o `update` sai com erro mas o repositório principal serve. `update && install` pulava o install — `set -e` não pega falha no meio de `&&` |
+| `apt-get` numa Pi com Debian 11 | instalador "passa", serviço morre em loop sem `cv2`; depois, 404 no install | o bullseye saiu do LTS (31/08/2026): o Release do `bullseye-security` expirou (o `update` sai com erro) e as listas velhas apontam para pacotes que saíram do servidor. `update && install` pulava o install — `set -e` não pega falha no meio de `&&`. O instalador segue sem o update e, se o install der 404, repete com `-t bullseye` |
 | "qual código está rodando nesta Pi?" | ninguém sabia sem comparar hash na mão | o instalador grava o commit em `VERSAO`; o serviço devolve `versao` no `/api/config` |
 
 ## Acesso às Raspberries
