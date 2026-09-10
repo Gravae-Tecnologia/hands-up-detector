@@ -330,7 +330,12 @@ class Camera:
         ia = self.ia
         if ia is None:
             return                     # a do arranque ainda esta rodando
-        prazo = (iamod.RESONDA_FALHA_S if ia.get("suporta") is None
+        # sem resposta: tenta de novo em 5 min. Credencial recusada NAO: senha
+        # nao se conserta sozinha, e cada tentativa e um login falho a mais
+        # rumo ao bloqueio do usuario na camera. Fica para o prazo longo ou
+        # para o "Testar cameras" do painel (sondar_ia).
+        prazo = (iamod.RESONDA_FALHA_S
+                 if ia.get("suporta") is None and ia.get("credencial") is not False
                  else iamod.RESONDA_OK_S)
         if agora - ia.get("sondado_em", 0) > prazo:
             self.sonda_ia()

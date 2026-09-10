@@ -62,6 +62,8 @@ DETECTOR_JANELA_S = 10.0
 #: Com que frequencia reconfirmar o que a camera oferece.
 RESONDA_OK_S = 6 * 3600       # ja sabemos a resposta: so para pegar mudanca
 RESONDA_FALHA_S = 300         # camera nao respondeu: tenta de novo logo
+#: Vigia que tomou 401 espera isto antes de tentar de novo (ver _DigestUmaVez).
+RECUO_CREDENCIAL_S = 1800
 
 #: Como a camera esta sendo usada, visto do painel. O OPS desenha a partir
 #: disto - e o contrato, nao mude os nomes sem mudar la.
@@ -253,13 +255,35 @@ def _kv(texto):
     return out
 
 
+class _DigestUmaVez(urllib.request.HTTPDigestAuthHandler):
+    """Digest com UMA tentativa autenticada por requisicao.
+
+    O handler da stdlib reenvia a credencial ate desistir: medido contra a
+    camera falsa, 6 logins falhos por requisicao com a senha errada. A Intelbras
+    BLOQUEIA o usuario depois de algumas tentativas erradas. E o mesmo
+    usuario que o Shinobi usa para gravar: travar a camera por causa da
+    sonda derrubaria o produto.
+    """
+
+    def http_error_401(self, req, fp, code, msg, headers):
+        if getattr(req, "_digest_tentado", False):
+            # Levanta aqui, e nao `return None`: devolvendo None, o handler
+            # Basic seguinte pega o desafio Digest, nao reconhece o esquema e
+            # levanta ValueError - a senha recusada viraria "camera nao
+            # respondeu" e voltaria para a sonda de 5 min.
+            raise urllib.error.HTTPError(req.full_url, 401, "credencial recusada",
+                                         headers, fp)
+        req._digest_tentado = True
+        return super().http_error_401(req, fp, code, msg, headers)
+
+
 def abridor(host, usuario, senha, porta=80):
     """urllib com Digest (o que as Intelbras pedem) e Basic (firmware antigo)."""
     raiz = f"http://{host}:{porta}/"
     senhas = urllib.request.HTTPPasswordMgrWithDefaultRealm()
     senhas.add_password(None, raiz, usuario, senha)
     return urllib.request.build_opener(
-        urllib.request.HTTPDigestAuthHandler(senhas),
+        _DigestUmaVez(senhas),
         urllib.request.HTTPBasicAuthHandler(senhas))
 
 
@@ -299,7 +323,10 @@ def sonda(host, usuario, senha, porta=80, timeout=6):
         ia["motivo"] = f"camera nao respondeu em http:{porta} ({corpo})"
         return ia
     if st == 401:
-        ia["motivo"] = "camera recusou a credencial do Shinobi"
+        # `credencial: False` faz a proxima sonda esperar o prazo longo (ver
+        # `RESONDA_OK_S`): senha nao se conserta sozinha, e insistir a cada 5
+        # min so acumularia login falho ate a camera bloquear o usuario.
+        ia.update(motivo="camera recusou a credencial do Shinobi", credencial=False)
         return ia
     if st != 200:
         ia.update(suporta=False,
@@ -409,6 +436,11 @@ class Vigia:
             except urllib.error.HTTPError as e:
                 self.erro = ("camera recusou a credencial" if e.code == 401
                              else f"HTTP {e.code} no attach")
+                if e.code == 401:
+                    # senha trocou depois da sonda: reconectar a cada minuto
+                    # seria um login falho por minuto ate a camera bloquear
+                    # o usuario (o mesmo do Shinobi). Espera longa.
+                    espera = RECUO_CREDENCIAL_S
             except Exception as e:
                 if not self._parar.is_set():
                     self.erro = f"{type(e).__name__}: {e}"[:120]
@@ -421,4 +453,4 @@ class Vigia:
                         pass
                 self.presenca.caiu(time.time())
             self._parar.wait(espera)
-            espera = min(espera * 2, 60)
+            espera = espera if espera >= RECUO_CREDENCIAL_S else min(espera * 2, 60)
