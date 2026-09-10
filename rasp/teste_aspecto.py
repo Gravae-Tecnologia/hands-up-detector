@@ -26,7 +26,7 @@ def _prop(wh):
 # ------------------------------------------------------------- substream
 def teste_url():
     print("1. url do substream e do principal")
-    base = "rtsp://u:p@192.168.30.191:554/cam/realmonitor?channel=1"
+    base = "rtsp://u:p@192.168.1.10:554/cam/realmonitor?channel=1"
     ok(url_substream(base + "&subtype=0") == base + "&subtype=1",
        "Intelbras/Dahua: subtype=0 -> 1")
     ok(url_substream(base + "&subtype=0&unicast=true") == base + "&subtype=1&unicast=true",

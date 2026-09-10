@@ -43,7 +43,6 @@ DETECTORES = {
 }
 POSES = {
     "rtmpose-s": dict(arq="rtmpose-s.onnx", entrada=(192, 256)),
-    "rtmpose-s-int8": dict(arq="rtmpose-s_int8.onnx", entrada=(192, 256)),
     "rtmpose-m": dict(arq="rtmpose-m.onnx", entrada=(192, 256)),
 }
 

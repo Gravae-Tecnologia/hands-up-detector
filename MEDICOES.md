@@ -186,8 +186,18 @@ escalar int8 (SDOT/UDOT) só chegaram no ARMv8.2-A. Sem elas o ganho teórico
 não aparece — pode até piorar, porque quantizar e desquantizar a cada camada
 tem custo real.
 
-**Só vale em Pi 5.** Os arquivos `*_int8.onnx` ficam no repositório para quando
-isso acontecer.
+**Só vale em Pi 5.** Medido em 09/09/2026 numa Pi 5 de arena (Costa Verde):
+detector `yolo11n_256x416_int8` a **23 ms** contra 51 do FP32 (2,2×), achando um
+pouco menos gente (3,4 contra 3,8 pessoas/quadro — F1 não medido).
+
+**O `rtmpose-s_int8.onnx` foi removido: ele devolvia ruído.** Contra o FP32 nos
+mesmos recortes, desvio mediano de **112 px numa entrada de 256 px** e confiança
+caindo de 0,46 para 0,13. Passou despercebido porque a contagem de pessoas vem do
+detector, e o INT8 nunca foi usado na Pi 4. O ganho no i5 citado acima era,
+portanto, de um modelo que não funcionava. Quatro receitas de requantização do
+RTMPose (ativação QInt8, sem por-canal, deixando de fora as últimas 6 e as
+últimas 16 convoluções) falharam igual: o dano está no backbone CSPNeXt, não na
+cabeça. O detector INT8 continua no repositório.
 
 Detalhe de export: quantização por canal exige **opset ≥ 13** (o atributo
 `axis` do `DequantizeLinear`). O YOLO saía em 12 e o RTMPose do mmdeploy em 11.
