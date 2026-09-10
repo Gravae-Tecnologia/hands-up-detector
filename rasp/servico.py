@@ -163,30 +163,57 @@ def url_principal(url):
     return None
 
 
-def sonda(url, timeout=20):
-    """(largura, altura) exibidas do video, ou None se nao respondeu.
+def dims_do_stream(s):
+    """(largura, altura) EXIBIDAS a partir de um stream do `ffprobe -show_streams`.
 
-    So metadado, nao decodifica quadro. Considera rotacao declarada: o ffmpeg
-    gira o quadro sozinho ao decodificar, entao as dimensoes que valem sao as
-    ja giradas.
+    A rotacao declarada mora em lugares diferentes conforme a versao: tag
+    `rotate` no ffprobe 4.x (Debian 11) e `side_data_list[].rotation` do 5 em
+    diante. O ffmpeg gira o quadro sozinho ao decodificar, entao as dimensoes
+    que valem sao as ja giradas.
+    """
+    if not s:
+        return None
+    w, h = int(s.get("width") or 0), int(s.get("height") or 0)
+    rot = 0
+    try:
+        rot = int(float((s.get("tags") or {}).get("rotate", 0)))
+    except (TypeError, ValueError):
+        pass
+    for sd in s.get("side_data_list") or []:
+        if "rotation" in sd:
+            try:
+                rot = int(float(sd["rotation"]))
+            except (TypeError, ValueError):
+                pass
+    if abs(rot) % 180 == 90:
+        w, h = h, w
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def sonda(url, timeout=20):
+    """-> ((largura, altura), None) ou (None, motivo). So metadado, nao
+    decodifica quadro.
+
+    `-show_streams` inteiro, e nao `-show_entries` com secao nomeada: a
+    secao `stream_side_data` nao existe no ffprobe 4.3 do Debian 11, e o
+    pedido falhava por inteiro ("No match for section") - a sonda dava None
+    SEMPRE e a camera nunca capturava. Foi a primeira instalacao no Fit Club.
     """
     try:
         p = subprocess.run(
             ["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
-             "-select_streams", "v:0",
-             "-show_entries", "stream=width,height:stream_side_data=rotation",
-             "-of", "json", url],
+             "-select_streams", "v:0", "-show_streams", "-of", "json", url],
             capture_output=True, timeout=timeout)
         s = (json.loads(p.stdout or b"{}").get("streams") or [None])[0]
-        if not s:
-            return None
-        w, h = int(s.get("width") or 0), int(s.get("height") or 0)
-        for sd in s.get("side_data_list") or []:
-            if abs(int(sd.get("rotation", 0))) % 180 == 90:
-                w, h = h, w
-        return (w, h) if w > 0 and h > 0 else None
-    except Exception:
-        return None
+        d = dims_do_stream(s)
+        if d:
+            return d, None
+        err = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        return None, (err[-1][:120] if err else "sem stream de video")
+    except subprocess.TimeoutExpired:
+        return None, f"ffprobe sem resposta em {timeout} s"
+    except Exception as e:
+        return None, type(e).__name__
 
 
 def dimensoes_analise(real, nativo, lado_max=LADO_MAX):
@@ -361,14 +388,14 @@ class Camera:
         """
         with self.lock_geo:
             principal = url_principal(self.cam["rtsp"]) or self.cam["rtsp"]
-            real = sonda(principal)
+            real, motivo = sonda(principal)
             if real is None:
-                self.erro = "stream principal nao respondeu a sonda"
+                self.erro = f"sonda do stream principal: {motivo}"
                 return self.larg is not None      # segue com a ultima conhecida
             fonte, nativo = principal, real
             sub = url_substream(principal) if self.usa_sub else None
             if sub:
-                ns = sonda(sub)
+                ns, _ = sonda(sub)
                 if ns:
                     fonte, nativo = sub, ns
             w, h = dimensoes_analise(real, nativo, self.lado_max)
