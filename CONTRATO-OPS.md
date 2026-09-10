@@ -137,5 +137,7 @@ Economia hoje: 64% do tempo pausado
    chaves, devolve o motivo quando o detector recusa e corrige a atualização
    que reinstalava código velho em silêncio). Sem push no
    `gravae-arena-agent-python`, ele segue como patch para quem mantém o repo.
-   Não conflita com o #36.
+   Aplica limpo na `main` do agent. Em cima do #36, só a linha `VERSION`
+   conflita (lá vira 3.8.0), por isso o painel deve confirmar pela leitura de
+   volta (`estado.config.gatilho`), e não pelo número da versão.
 2. **Fit Club:** agent 3.6.9 → atualizar pelo OPS para aparecer no painel.
