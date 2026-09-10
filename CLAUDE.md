@@ -126,6 +126,7 @@ o que só ela mede.
 | evento de humano "parou" com gente em quadra | pausa no meio do jogo | `SmartMotionHuman` é movimento; quem está parado não gera evento. O prazo de 10 min + as pessoas vistas pelo detector seguram |
 | linha do evento com `data={` | parser quebra no JSON | cada evento vem seguido de um JSON de várias linhas (hora, UTC, nome); só a linha `Code=` interessa |
 | `apt-get` numa Pi com Debian 11 | instalador "passa", serviço morre em loop sem `cv2`; depois, 404 no install | o bullseye saiu do LTS (31/08/2026): o Release do `bullseye-security` expirou (o `update` sai com erro) e as listas velhas apontam para pacotes que saíram do servidor. `update && install` pulava o install — `set -e` não pega falha no meio de `&&`. O instalador segue sem o update e, se o install der 404, repete com `-t bullseye` |
+| update pelo agent "ok" com código velho | a Pi reinstala a versão anterior | a ponte do agent ≤ 3.7.8 dá `chmod 755` no `instalar.sh`; com o arquivo 100644 no git, o clone fica sujo e o `pull --ff-only` seguinte falha calado. O arquivo agora é **100755 no git**: o chmod vira operação vazia |
 | "qual código está rodando nesta Pi?" | ninguém sabia sem comparar hash na mão | o instalador grava o commit em `VERSAO`; o serviço devolve `versao` no `/api/config` |
 
 ## Acesso às Raspberries

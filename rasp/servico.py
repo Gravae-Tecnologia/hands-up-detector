@@ -1401,32 +1401,7 @@ class H(BaseHTTPRequestHandler):
             return self._json(list(reversed(H.alertas[-40:])))
         if self.path.startswith("/api/config"):
             # o OPS le isto para desenhar os switches (o agente repassa inteiro)
-            agora = time.time()
-            d = dict(H.conf.d)
-            d["arena"] = H.cfg.get("arena", "")
-            d["versao"] = H.cfg.get("versao", "desconhecida")
-            d["quadras_detalhe"] = [
-                {"quadra": q,
-                 "ligada": bool(d["quadras"].get(q)),
-                 "cameras": [dict({"mid": c.mid,
-                                   "ligada": bool(d["cameras"].get(c.mid)),
-                                   "processando": c.ativa},
-                                  **c.resumo_gatilho(agora))
-                             for c in H.cams.values()
-                             if cfgmod.Config.quadra_de(c.mid) == q]}
-                for q in sorted(d["quadras"])]
-            cams = list(H.cams.values())
-            # o que o painel precisa para oferecer o gatilho "ia": quantas
-            # cameras tem IA utilizavel, e se ainda falta resposta de alguma
-            d["ia_resumo"] = {
-                "cameras": len(cams),
-                "com_ia": sum(1 for c in cams if iamod.usavel(c.ia)),
-                "sem_resposta": sum(1 for c in cams
-                                    if c.ia is None or c.ia.get("suporta") is None),
-                "sondando": any(c.sondando for c in cams),
-            }
-            d["modos"] = iamod.MODOS
-            return self._json(d)
+            return self._json(config_publica())
         if self.path.startswith("/foto/"):
             # UM JPEG, requisicao curta. O painel poda a 1 fps por polling em
             # vez de segurar um multipart aberto: a conexao passa por
@@ -1556,6 +1531,43 @@ class H(BaseHTTPRequestHandler):
         return self._json({"ok": True, "mid": c.mid, "ativa": c.ativa,
                            "desligadas": [o.mid for o in H.cams.values()
                                           if not o.ativa]})
+
+
+def config_publica():
+    """O GET /api/config: a config + o detalhe por quadra/camera que o OPS
+    desenha. Ver CONTRATO-OPS.md - os nomes daqui sao o contrato."""
+    agora = time.time()
+    d = dict(H.conf.d)
+    d["arena"] = H.cfg.get("arena", "")
+    d["versao"] = H.cfg.get("versao", "desconhecida")
+    # TODAS as quadras que tem camera, e nao so as do mapa de chaves. O
+    # `sincroniza` do arranque ja cria cada uma desligada, mas o painel
+    # precisa ver as cameras - e o selo de IA de cada uma - antes de qualquer
+    # coisa ser ligada, e isso nao pode depender de o mapa estar em dia.
+    quadras = sorted(set(d["quadras"])
+                     | {cfgmod.Config.quadra_de(c.mid) for c in H.cams.values()})
+    d["quadras_detalhe"] = [
+        {"quadra": q,
+         "ligada": bool(d["quadras"].get(q)),
+         "cameras": [dict({"mid": c.mid,
+                           "ligada": bool(d["cameras"].get(c.mid)),
+                           "processando": c.ativa},
+                          **c.resumo_gatilho(agora))
+                     for c in H.cams.values()
+                     if cfgmod.Config.quadra_de(c.mid) == q]}
+        for q in quadras]
+    cams = list(H.cams.values())
+    # o que o painel precisa para oferecer o gatilho "ia": quantas cameras tem
+    # IA utilizavel, e se ainda falta resposta de alguma
+    d["ia_resumo"] = {
+        "cameras": len(cams),
+        "com_ia": sum(1 for c in cams if iamod.usavel(c.ia)),
+        "sem_resposta": sum(1 for c in cams
+                            if c.ia is None or c.ia.get("suporta") is None),
+        "sondando": any(c.sondando for c in cams),
+    }
+    d["modos"] = iamod.MODOS
+    return d
 
 
 def estatisticas():

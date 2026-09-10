@@ -304,8 +304,18 @@ def teste_servico(porta):
     try:
         c = S.Camera(cam)
         S.H.cams = {c.mid: c}
-        S.H.conf.sincroniza([c.mid])
+        # instalacao nova: o instalar.sh grava "quadras": {} e nada ligado
+        cams = [x for q in S.config_publica()["quadras_detalhe"] for x in q["cameras"]]
+        ok([x["mid"] for x in cams] == [c.mid],
+           "instalacao nova (mapa de quadras vazio): a camera ja sai no detalhe")
         ok(espera(lambda: c.ia is not None), "sondou a camera no arranque")
+        S.aplica_config()
+        x = [x for q in S.config_publica()["quadras_detalhe"] for x in q["cameras"]][0]
+        ok(x["ligada"] is False and x["processando"] is False
+           and x["modo"] == "desligada" and x["presenca"] is None
+           and x["ia_usavel"] is True and x["ia"]["modelo"] == "VIP-3430-D-IA",
+           "tudo desligado: ligada/processando false, desligada, presenca null, ia preenchido")
+        S.H.conf.sincroniza([c.mid])
         ok(S.aplica_config() == [] and c.modo == "desligada",
            "tudo desligado por padrao (invariante 3)")
         S.H.conf.define(ativo=True)
