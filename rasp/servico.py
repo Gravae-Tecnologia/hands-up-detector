@@ -63,6 +63,16 @@ DIR = os.path.dirname(os.path.abspath(__file__))
 NUVEM = None          # http.client.HTTPConnection por camera, se modo nuvem
 
 
+def versao():
+    """Commit instalado, gravado pelo instalar.sh em VERSAO. E como o OPS
+    confere que uma atualizacao chegou de verdade a esta Pi."""
+    try:
+        with open(os.path.join(DIR, "VERSAO"), encoding="utf-8") as f:
+            return f.read().strip() or "desconhecida"
+    except OSError:
+        return "desconhecida"
+
+
 def cameras():
     """Monitores do Shinobi, com o RTSP completo.
 
@@ -1365,6 +1375,7 @@ class H(BaseHTTPRequestHandler):
             agora = time.time()
             d = dict(H.conf.d)
             d["arena"] = H.cfg.get("arena", "")
+            d["versao"] = H.cfg.get("versao", "desconhecida")
             d["quadras_detalhe"] = [
                 {"quadra": q,
                  "ligada": bool(d["quadras"].get(q)),
@@ -1638,7 +1649,7 @@ def main():
     for k, padrao in (("em_voo_max", 4), ("em_voo_min", 1), ("ajuste_s", 10.0)):
         H.cfg[k] = H.conf.d.get(k, padrao)
     sel = todas
-    print(f"{len(sel)} cameras | ativo={H.conf.d['ativo']} | "
+    print(f"versao {versao()} | {len(sel)} cameras | ativo={H.conf.d['ativo']} | "
           f"config={H.conf.caminho} | "
           f"captura: {'substream' if usa_sub else 'principal'}, proporcao da "
           f"camera, lado <= {args.lado_max}", flush=True)
@@ -1652,6 +1663,7 @@ def main():
     # cameras leem dele ao serem criadas
     H.cfg.update({"threads": args.threads, "fps": args.fps,
                   "nuvem": args.nuvem, "t0": time.time(),
+                  "versao": versao(),
                   "webhook": args.webhook,
                   "api_key": dev.get("shinobiApiKey", ""),
                   # `deviceId` no device.json E o serial do Raspberry - e como
