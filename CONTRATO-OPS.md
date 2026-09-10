@@ -45,7 +45,10 @@ Campos da arena:
 | `versao` | str (commit) | conferir que a atualização chegou a esta Pi |
 | `modos` | `{modo: descrição}` | legenda pronta dos estados |
 
-Por câmera, em `quadras[].cameras[]` (mesma lista de sempre, com campos novos):
+Por câmera, em `quadras[].cameras[]` (mesma lista de sempre, com campos novos). A lista traz **todas** as
+câmeras do Shinobi mesmo com tudo desligado, como numa instalação nova: `ligada` e `processando` vêm
+`false`, `modo` vem `desligada`, `presenca` vem `null`, e `ia` vem `null` só até a sonda do arranque
+terminar.
 
 | campo | exemplo real (Fit Club, 10/09) | uso |
 |---|---|---|
