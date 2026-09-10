@@ -100,6 +100,32 @@ terminar.
 - **`sondar_ia`** ("Testar câmeras"): responde na hora. O resultado aparece no
   próximo status, em poucos segundos (`ia_resumo.sondando` volta a `false`).
 
+## Instalação (`POST /hands-up/install`)
+
+Responde na hora: `{"ok": true, "iniciado": true, "instalacao": {"estado": "rodando", ...}}`.
+Se já houver uma instalação em curso, vem `{"ok": false, "ja_rodando": true, ...}`. Acompanhe
+por `status().instalacao`:
+
+| campo | valores |
+|---|---|
+| `estado` | `ocioso` → `rodando` → `concluido` \| `falhou` |
+| `etapa` | agent ≤ 3.7.8: fica `clone` durante toda a instalação e vira `instalar.sh` só no fim. Com o patch 3.7.9: `clone` (do zero) ou `atualiza` (já tinha) → `instalar.sh` durante a execução |
+| `ok`, `erro`, `saida` | preenchidos no fim; `saida` traz o fim do log do instalador |
+
+**Já instalado:** o mesmo botão atualiza o código e roda o instalador de novo, que preserva a
+config (nada liga, nada desliga). O serviço reinicia, então o detector fica ~2 s sem responder.
+
+Medido na Costa Verde (Pi 5, Debian 13, 8 câmeras, 10/09):
+
+| caso | tempo |
+|---|---|
+| do zero, sem OpenCV na Pi | 181 s: clone ~35 s + `instalar.sh` 146 s (apt do `python3-opencv`) |
+| já instalado | 9 s |
+| do serviço subir até `ia` preenchido nas 8 câmeras | ~3 s (sondas em paralelo) |
+
+Logo depois de instalar, `quadras` e `cameras` **não** vêm `{}`: o serviço cria todas como
+`false` ao subir.
+
 ## Tela sugerida
 
 ```
