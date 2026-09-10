@@ -11,6 +11,10 @@ WORKDIR /app
 RUN pip install --no-cache-dir onnxruntime==1.22.0 numpy opencv-python-headless
 
 COPY motor.py app.py ./
+# modelos/ precisa ter o detector nas DUAS orientacoes, gerado por
+# `python exportar_detector.py` (yolo11s_416x640 e yolo11s_640x416). Sem o em pe
+# a imagem sobe igual, mas quadro de camera "story" usa a entrada deitada e
+# aproveita ~37% da largura - pessoa do fundo some. GET / lista `orientacoes`.
 COPY modelos/ ./modelos/
 
 ENV PYTHONUNBUFFERED=1 MODELOS=/app/modelos

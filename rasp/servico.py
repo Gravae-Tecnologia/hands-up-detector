@@ -36,6 +36,7 @@ import json
 import os
 import http.client
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -46,7 +47,10 @@ import cv2
 import numpy as np
 
 import config as cfgmod
+import cronologia as cronmod
 import motor
+import rastreio as rastmod
+import revisao as revmod
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 NUVEM = None          # http.client.HTTPConnection por camera, se modo nuvem
@@ -100,21 +104,126 @@ def throttled():
         return "?"
 
 
+# ---------------------------------------------------------------- geometria
+#: Teto do lado maior do quadro de analise. O substream das cameras em pe da
+#: CTF Marcelinho e 480x704 e passa inteiro; o teto so atua em camera cujo
+#: substream seja grande, para o JPEG enviado a nuvem nao crescer sem limite.
+LADO_MAX = 720
+
+
+def url_substream(url):
+    """URL do substream da MESMA camera, ou None se o padrao nao for conhecido.
+
+    Por que ler o substream: o stream principal das cameras em pe e 1440x2560
+    H.264 a 30 fps, e o ffmpeg decodifica TODOS os quadros para aproveitar 1
+    por segundo. Medido na CTF Marcelinho (Pi 4), a 1 fps: 61% de um nucleo
+    por camera no principal, 10% no substream (480x704 H.265). Com tres
+    cameras, ~183% contra ~30% - e foi o principal que levou a Pi a 81,8 C.
+
+    Padroes: Intelbras/Dahua (`subtype=0` -> `subtype=1`) e Hikvision
+    (`/Streaming/Channels/101` -> `102`). Fora deles, fica no principal.
+    """
+    if re.search(r"subtype=0\b", url):
+        return re.sub(r"subtype=0\b", "subtype=1", url)
+    m = re.search(r"(/Streaming/Channels/\d+?)01\b", url, re.I)
+    if m:
+        return url[:m.start()] + m.group(1) + "02" + url[m.end():]
+    return None
+
+
+def url_principal(url):
+    """URL do stream PRINCIPAL, mesmo que o Shinobi esteja cadastrado no
+    substream. E do principal que sai a proporcao verdadeira da cena - o
+    substream pode ser anamorfico. None se o padrao nao for conhecido."""
+    if re.search(r"subtype=\d+\b", url):
+        return re.sub(r"subtype=\d+\b", "subtype=0", url)
+    m = re.search(r"(/Streaming/Channels/\d+?)0\d\b", url, re.I)
+    if m:
+        return url[:m.start()] + m.group(1) + "01" + url[m.end():]
+    return None
+
+
+def sonda(url, timeout=20):
+    """(largura, altura) exibidas do video, ou None se nao respondeu.
+
+    So metadado, nao decodifica quadro. Considera rotacao declarada: o ffmpeg
+    gira o quadro sozinho ao decodificar, entao as dimensoes que valem sao as
+    ja giradas.
+    """
+    try:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=width,height:stream_side_data=rotation",
+             "-of", "json", url],
+            capture_output=True, timeout=timeout)
+        s = (json.loads(p.stdout or b"{}").get("streams") or [None])[0]
+        if not s:
+            return None
+        w, h = int(s.get("width") or 0), int(s.get("height") or 0)
+        for sd in s.get("side_data_list") or []:
+            if abs(int(sd.get("rotation", 0))) % 180 == 90:
+                w, h = h, w
+        return (w, h) if w > 0 and h > 0 else None
+    except Exception:
+        return None
+
+
+def dimensoes_analise(real, nativo, lado_max=LADO_MAX):
+    """Tamanho do quadro de analise: a PROPORCAO da cena com os PIXELS do
+    stream que vamos ler, sem nunca aumentar resolucao.
+
+    `real`    (w, h) do stream principal - e dele a proporcao verdadeira.
+    `nativo`  (w, h) do stream lido, que pode ser ANAMORFICO. Na CTF o
+              substream e 480x704 para uma cena 9:16: os pixels vem esticados
+              21% na horizontal, e a camera NAO declara isso
+              (sample_aspect_ratio=N/A). Usar os pixels crus deixaria cada
+              pessoa 21% mais larga - e o gesto e medido em larguras de ombro.
+
+    Devolve o maior retangulo com a proporcao real que cabe nos pixels
+    nativos, limitado a `lado_max`, com lados pares. 1440x2560 lido pelo
+    substream 480x704 vira 396x704: a altura nativa inteira, a largura
+    corrigida.
+    """
+    ar = real[0] / real[1]
+    w, h = float(nativo[0]), float(nativo[1])
+    if w / h > ar:
+        w = h * ar          # nativo mais "largo" que a cena: estreita
+    else:
+        h = w / ar          # mais "alto": encurta
+    f = min(1.0, lado_max / max(w, h))
+    par = lambda v: max(2, int(round(v * f / 2)) * 2)
+    return par(w), par(h)
+
+
 class Camera:
     """Captura 1 fps de uma camera e guarda SO o quadro mais recente.
 
-    A captura so existe enquanto a camera esta LIGADA. Cada ffmpeg custava
-    ~27% de um nucleo (o stream principal e 1280x720@30 e o `-vf fps=1`
-    descarta DEPOIS de decodificar), entao manter quatro rodando gastava
-    ~110% de CPU com tres cameras que ninguem estava olhando - e a Pi ja
-    chegou a 84,7 C com throttling ativo por causa disso.
+    A captura so existe enquanto a camera esta LIGADA: o `-vf fps=1` descarta
+    DEPOIS de decodificar, entao cada ffmpeg paga o stream inteiro. Com o
+    principal a 1280x720 eram ~27% de um nucleo por camera; com as cameras em
+    pe a 1440x2560, 61%. Por isso a captura le o SUBSTREAM (10%).
+
+    GEOMETRIA VEM DA CAMERA, NAO DE CONSTANTE. Ate aqui o quadro era sempre
+    esticado para 640x400. Quando as cameras viraram para o modo "story"
+    (9:16), cada pessoa passou a chegar achatada ~2,8x na vertical - e o
+    criterio do gesto e vertical (punho acima do ombro em larguras de ombro).
+    Foi o que parou a deteccao. Agora a proporcao sai do stream principal e os
+    pixels do substream, ver `_geometria`, e isso e refeito a cada conexao:
+    se virarem a camera de novo, a proxima reconexao ja pega.
 
     Para a grade continuar util sem custo, cada camera guarda uma FOTO tirada
     uma vez so no arranque.
     """
 
-    def __init__(self, cam, larg, alt, fps=1.0):
-        self.cam, self.larg, self.alt, self.fps = cam, larg, alt, fps
+    def __init__(self, cam, lado_max=LADO_MAX, fps=1.0, substream=True):
+        self.cam, self.fps = cam, fps
+        self.lado_max, self.usa_sub = lado_max, substream
+        # decididos por `_geometria` a partir da propria camera
+        self.fonte = None           # URL que o ffmpeg le
+        self.larg = self.alt = None # quadro de analise, na proporcao real
+        self.geo = {}               # o que foi medido, para o /api/stats
+        self.lock_geo = threading.Lock()
         self.mid = cam["mid"]
         self.lock = threading.Lock()
         self.quadro = None          # ultimo quadro cru
@@ -127,43 +236,112 @@ class Camera:
         self.m = {"capturados": 0, "processados": 0, "descartados": 0,
                   "pessoas": 0, "gestos": 0, "ms": 0.0, "ms_det": 0.0,
                   "ms_pose": 0.0, "ms_encode": 0.0, "ms_rede": 0.0,
-                  "kb": 0.0, "falhas": 0, "ultimo_gesto": 0.0, "amostras": []}
+                  "kb": 0.0, "falhas": 0, "ultimo_gesto": 0.0,
+                  "instantaneos": 0, "segurando": 0.0, "amostras": []}
         self.nuvem = None
+        self.cron = None
+        # um rastreador POR CAMERA: pessoas de quadras diferentes nao se
+        # confundem, e cada camera tem sua propria escala de pixels
+        self.rast = rastmod.Rastreador(dur_s=H.cfg.get("dur_gesto", 2.0))
         self.parar = threading.Event()
         self.thread = None
         threading.Thread(target=self.foto, daemon=True).start()
 
-    def foto(self):
-        """Um quadro so, para a miniatura. Custa um ffmpeg de ~2 s e acabou."""
-        n = self.larg * self.alt * 3
-        try:
+    def _geometria(self):
+        """De onde ler e em que tamanho, medido na camera. True se ha
+        geometria valida (nova, ou a ultima conhecida se a sonda falhou).
+
+        A proporcao verdadeira so vem do stream PRINCIPAL: o substream pode
+        ser anamorfico e nao declara (ver `dimensoes_analise`). A sonda e so
+        metadado - uma conexao curta, sem decodificar.
+        """
+        with self.lock_geo:
+            principal = url_principal(self.cam["rtsp"]) or self.cam["rtsp"]
+            real = sonda(principal)
+            if real is None:
+                self.erro = "stream principal nao respondeu a sonda"
+                return self.larg is not None      # segue com a ultima conhecida
+            fonte, nativo = principal, real
+            sub = url_substream(principal) if self.usa_sub else None
+            if sub:
+                ns = sonda(sub)
+                if ns:
+                    fonte, nativo = sub, ns
+            w, h = dimensoes_analise(real, nativo, self.lado_max)
+            self.fonte, self.larg, self.alt = fonte, w, h
+            self.geo = {"fonte": "substream" if fonte != principal else "principal",
+                        "real": list(real), "nativo": list(nativo),
+                        "analise": [w, h],
+                        "orientacao": "retrato" if h > w else "paisagem"}
+            return True
+
+    def dims(self):
+        """(largura, altura) do quadro de analise; antes da primeira sonda,
+        um tamanho neutro so para o marcador cinza do painel."""
+        return (self.larg or 640, self.alt or 360)
+
+    def foto(self, tentativas=3):
+        """Um quadro so, para a miniatura. Custa um ffmpeg de ~2 s e acabou.
+
+        RETENTA, e o motivo e um bug real: a `foto` so era chamada no
+        construtor e no `desliga`. Uma falha unica deixava `saida` em None
+        para SEMPRE, e como o `/quadro/` so escreve quando ha bytes, o <img>
+        do painel nunca recebia nada e o tile aparecia PRETO ate alguem ligar
+        a camera. Falhar na primeira e comum: a camera ja serve o stream
+        principal para o Shinobi e para a nossa captura, e recusa a sessao a
+        mais.
+
+        A guarda tambem estava errada. Era `if ok and not self.ativa`, entao
+        uma foto que terminasse depois da camera ser ligada era JOGADA FORA -
+        e como ela leva ate 40 s, isso acontece toda vez que o servico sobe
+        com camera ja ligada. Agora so nao sobrescreve quadro ANOTADO: se a
+        miniatura ainda e None, vale mesmo com a camera ligada.
+
+        Sai do substream, como a captura: alem de barato, e outra sessao que
+        nao o principal que o Shinobi ja segura.
+        """
+        for _t in range(tentativas):
+          try:
+            if not self._geometria():
+                time.sleep(3 * (_t + 1))
+                continue
+            w, h, fonte = self.larg, self.alt, self.fonte
+            n = w * h * 3
             p = subprocess.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-rtsp_transport", "tcp", "-i", self.cam["rtsp"],
-                 "-frames:v", "1", "-vf", f"scale={self.larg}:{self.alt}",
+                 "-rtsp_transport", "tcp", "-i", fonte,
+                 "-frames:v", "1", "-vf", f"scale={w}:{h}",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                 capture_output=True, timeout=40)
             if len(p.stdout) >= n:
-                img = np.frombuffer(p.stdout[:n], np.uint8).reshape(
-                    self.alt, self.larg, 3)
+                img = np.frombuffer(p.stdout[:n], np.uint8).reshape(h, w, 3)
                 ok, enc = cv2.imencode(".jpg", img,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-                if ok and not self.ativa:
+                if ok and (not self.ativa or self.saida is None):
                     self.saida = enc.tobytes()
+                return
             else:
-                self.erro = p.stderr.decode("utf-8", "replace").strip()[:120]
-        except Exception as e:
+                self.erro = (p.stderr.decode("utf-8", "replace").strip()[:120]
+                             or "sem quadro")
+          except Exception as e:
             self.erro = f"{type(e).__name__}"
+          time.sleep(3 * (_t + 1))
 
     def liga(self):
         if self.ativa:
             return
         self.ativa = True
         self.parar.clear()
+        if self.nuvem is not None:
+            self.cron = cronmod.Cronologia(
+                enviar=self._envia_nuvem, consumir=self._consome,
+                fps=self.fps, nome=self.mid,
+                em_voo_min=H.cfg.get("em_voo_min", 1),
+                em_voo_max=H.cfg.get("em_voo_max", 4),
+                ajuste_s=H.cfg.get("ajuste_s", 10.0))
+            self.cron.inicia()
         self.thread = threading.Thread(target=self._captura, daemon=True)
         self.thread.start()
-        if self.nuvem is not None:
-            threading.Thread(target=self._laco_nuvem, daemon=True).start()
 
     def desliga(self):
         if not self.ativa:
@@ -173,17 +351,26 @@ class Camera:
         if self.thread:
             self.thread.join(timeout=8)
         self.thread = None
+        if self.cron is not None:
+            self.cron.para()
+            self.cron = None
         with self.lock:
             self.novo = False
         threading.Thread(target=self.foto, daemon=True).start()
 
     def _captura(self):
-        n = self.larg * self.alt * 3
         while not self.parar.is_set():
+            # Geometria medida A CADA conexao, nao uma vez so: e na reconexao
+            # que uma camera virada de orientacao aparece.
+            if not self._geometria():
+                self.parar.wait(10)
+                continue
+            w, h, fonte = self.larg, self.alt, self.fonte
+            n = w * h * 3
             p = subprocess.Popen(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error",
-                 "-rtsp_transport", "tcp", "-i", self.cam["rtsp"],
-                 "-vf", f"fps={self.fps},scale={self.larg}:{self.alt}",
+                 "-rtsp_transport", "tcp", "-i", fonte,
+                 "-vf", f"fps={self.fps},scale={w}:{h}",
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=n * 3)
             try:
@@ -193,18 +380,26 @@ class Camera:
                         self.erro = (p.stderr.read(200).decode("utf-8", "replace")
                                      .strip()[:120] or "stream caiu")
                         break
-                    img = np.frombuffer(buf, np.uint8).reshape(
-                        self.alt, self.larg, 3).copy()
-                    with self.lock:
-                        # o quadro anterior nao chegou a ser processado: e
-                        # descarte, e conta como tal
-                        if self.novo:
+                    img = np.frombuffer(buf, np.uint8).reshape(h, w, 3).copy()
+                    self.m["capturados"] += 1
+                    self.erro = None
+                    if self.cron is not None:
+                        # o pipe e SEMPRE lido (senao o buffer do ffmpeg enche
+                        # e entrega quadro velho depois); a Cronologia decide
+                        # se este vira requisicao ou e recusado. Os dois
+                        # motivos de recusa sao contados separados nela
+                        # (`decimados` x `sem_vaga`) - somar os dois num
+                        # "descartados" so esconderia qual dos dois esta
+                        # acontecendo.
+                        if not self.cron.oferece(img):
                             self.m["descartados"] += 1
-                        self.quadro = img
-                        self.t_quadro = time.time()
-                        self.novo = True
-                        self.m["capturados"] += 1
-                        self.erro = None
+                    else:
+                        with self.lock:
+                            if self.novo:
+                                self.m["descartados"] += 1
+                            self.quadro = img
+                            self.t_quadro = time.time()
+                            self.novo = True
             finally:
                 p.kill()
             if not self.parar.is_set():
@@ -217,86 +412,138 @@ class Camera:
             self.novo = False
             return self.quadro
 
-    def _laco_nuvem(self):
-        """Captura -> JPEG -> POST -> desenha. Nenhuma inferencia na Pi.
+    def _envia_nuvem(self, q):
+        """Roda nas threads de envio da Cronologia. Pode bloquear na rede.
 
-        Roda uma thread por camera porque a chamada e ligada a I/O: enquanto
-        uma espera a resposta, as outras usam a rede. Um pool de 2 workers,
-        que e o certo para CPU, seria o gargalo errado aqui.
+        Levantar excecao marca o quadro como falho e a janela avanca sem
+        travar a camera - por isso o erro nao e engolido aqui.
         """
-        while not self.parar.is_set():
-            img = t_cap = None
-            with self.lock:
-                if self.novo:
-                    img, t_cap, self.novo = self.quadro, self.t_quadro, False
-            if img is None:
-                self.parar.wait(0.05)
-                continue
-            t_envio = time.time()
-            r, ms_encode, ms_rede = self.nuvem.infere(img)
-            t_resp = time.time()
-            if r is None or "erro" in r:
-                self.erro = (r or {}).get("erro", "sem resposta")
-                self.m["falhas"] += 1
-                if H.registro:
-                    H.registro.escreve(cam=self.mid, evento="falha",
-                                       erro=self.erro,
-                                       t_captura=t_cap, t_envio=t_envio,
-                                       t_resposta=t_resp,
-                                       ms_encode=round(ms_encode, 1))
-                continue
-            self.erro = None
-            kpts = [np.array(k, np.float32) for k in r.get("kpts", [])]
-            caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
-            gestos = [False] * len(kpts)
-            # o servidor ja aplicou o criterio; aqui so marcamos quais
-            for i in range(min(r.get("gestos", 0), len(kpts))):
-                gestos[i] = True
-            motor.desenha(img, caixas, kpts, conf_min=0.0, gestos=gestos)
-            total = ms_encode + ms_rede + r.get("ms_servidor", 0)
-            cv2.putText(img, f"{self.cam[chr(39)+chr(39)] if False else self.cam['nome']}"
-                        f"  NUVEM {total:.0f}ms  {len(kpts)}p",
-                        (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            ok, enc = cv2.imencode(".jpg", img,
-                                   [int(cv2.IMWRITE_JPEG_QUALITY), 82])
-            if ok:
-                self.saida = enc.tobytes()
-            m = self.m
-            m["processados"] += 1
-            m["pessoas"] = len(kpts)
-            m["gestos"] += r.get("gestos", 0)
-            if r.get("gestos", 0):
-                m["ultimo_gesto"] = time.time()
-            m["ms"] = total
-            m["ms_encode"], m["ms_rede"] = ms_encode, ms_rede
-            m["ms_det"] = r.get("ms_infer", 0.0)
-            m["ms_pose"] = r.get("ms_servidor", 0.0) - r.get("ms_infer", 0.0)
-            m["kb"] = r.get("_bytes", 0) / 1024
-            m["amostras"].append(total)
-            del m["amostras"][:-120]
+        r, ms_encode, ms_rede = self.nuvem.infere(q.img)
+        if r is None or "erro" in r:
+            raise RuntimeError((r or {}).get("erro", "sem resposta"))
+        return r, {"ms_encode": ms_encode, "ms_rede": ms_rede}
 
-            n_g = r.get("gestos", 0)
+    def _consome(self, q):
+        """Roda numa thread unica, SEMPRE em ordem de seq.
+
+        O relogio do rastreio e `q.t_captura`, nao o instante da resposta: com
+        a latencia variando de 400 a 3.420 ms, usar a chegada faria o
+        `segurando_s` do gesto carregar o jitter da rede em vez do tempo real
+        que a pessoa segurou os bracos.
+        """
+        if q.erro:
+            self.erro = q.erro
+            self.m["falhas"] += 1
             if H.registro:
-                H.registro.escreve(
-                    cam=self.mid, evento="gesto" if n_g else "quadro",
-                    pessoas=len(kpts), gestos=n_g,
-                    t_captura=t_cap, t_envio=t_envio, t_resposta=t_resp,
-                    fila_ms=round((t_envio - t_cap) * 1e3, 1),
-                    ms_encode=round(ms_encode, 1),
-                    ms_rede=round(ms_rede, 1),
-                    ms_servidor=r.get("ms_servidor"),
-                    ms_infer=r.get("ms_infer"),
-                    ms_decode=r.get("ms_decode"),
-                    ms_total=round(total, 1),
-                    ms_captura_ate_resposta=round((t_resp - t_cap) * 1e3, 1),
-                    kb=round(m["kb"], 1), modelo=r.get("modelo"),
-                    temp=round(temperatura(), 1))
-            if n_g:
-                # aviso na hora, fora do laco: a rede da plataforma nao pode
-                # atrasar o proximo quadro
-                threading.Thread(
-                    target=self._avisa, args=(n_g, len(kpts), t_cap, t_resp),
-                    daemon=True).start()
+                H.registro.escreve(cam=self.mid, evento="falha", seq=q.seq,
+                                   erro=q.erro, t_captura=q.t_captura,
+                                   t_envio=q.t_envio, t_resposta=q.t_resposta)
+            return
+        img, t_cap = q.img, q.t_captura
+        t_envio, t_resp = q.t_envio, q.t_resposta
+        r = q.resultado
+        ms_encode = q.meta.get("ms_encode", 0.0)
+        ms_rede = q.meta.get("ms_rede", 0.0)
+        self.erro = None
+        kpts = [np.array(k, np.float32) for k in r.get("kpts", [])]
+        caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
+        # margem continua por pessoa: e o que permite recalibrar o limiar
+        # depois sem recapturar nada
+        margens = [motor.gesto_margem(k) for k in kpts]
+
+        # confirmacao temporal ANTES de desenhar: o gesto so vale se a
+        # MESMA pessoa segurar por `dur_s`. Sem rastreio, dois quadros de
+        # pessoas diferentes pareceriam uma segurando.
+        por_pessoa, confirmados = self.rast.passo(
+            kpts, margens, revmod.LIMIAR, caixas=caixas, agora=t_cap)
+        n_g = len(confirmados)
+        n_inst = sum(1 for p in por_pessoa if p["instantaneo"])
+
+        # a pessoa de MAIOR margem e a que interessa registrar: e quem
+        # esta com os bracos mais levantados no quadro
+        i_pico, pico = -1, None
+        for i, mm in enumerate(margens):
+            if mm is not None and (pico is None or mm > pico):
+                i_pico, pico = i, mm
+        # copia LIMPA antes de desenhar: o esqueleto cobre o rosto, e o
+        # historico existe justamente para reconhecer quem levantou a mao.
+        # So copia quando ha evidencia a guardar - 768 KB por quadro seria
+        # desperdicio a 1 fps sem gesto nenhum.
+        precisa = (H.revisao is not None and pico is not None
+                   and pico >= revmod.QUASE)
+        img_limpo = img.copy() if precisa else None
+
+        motor.desenha(img, caixas, kpts, conf_min=0.0,
+                      gestos=[p["confirmado"] for p in por_pessoa],
+                      trilhas=[p["id"] for p in por_pessoa])
+        for i, p in enumerate(por_pessoa):
+            if i >= len(caixas):
+                return
+            x1, y1 = int(caixas[i][0]), int(caixas[i][1])
+            if p["instantaneo"] and not p["confirmado"]:
+                cv2.putText(img, f"{p['segurando_s']:.1f}s",
+                            (x1, max(y1 - 22, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 200, 255), 2)
+        total = ms_encode + ms_rede + r.get("ms_servidor", 0)
+        rr = self.rast.resumo()
+        cv2.putText(img, f"{self.cam['nome']}  {total:.0f}ms  {len(kpts)}p  "
+                    f"trilhas {rr['trilhas_vivas']}  "
+                    f"int {rr['intervalo_s']:.1f}s  tol {rr['tolerancia_s']:.1f}s",
+                    (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+        ok, enc = cv2.imencode(".jpg", img,
+                               [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if ok:
+            self.saida = enc.tobytes()
+        m = self.m
+        m["processados"] += 1
+        m["pessoas"] = len(kpts)
+        m["gestos"] += n_g
+        m["instantaneos"] += n_inst
+        m["segurando"] = max((p["segurando_s"] for p in por_pessoa), default=0.0)
+        if n_g:
+            m["ultimo_gesto"] = time.time()
+        m["ms"] = total
+        m["ms_encode"], m["ms_rede"] = ms_encode, ms_rede
+        m["ms_det"] = r.get("ms_infer", 0.0)
+        m["ms_pose"] = r.get("ms_servidor", 0.0) - r.get("ms_infer", 0.0)
+        m["kb"] = r.get("_bytes", 0) / 1024
+        m["amostras"].append(total)
+        del m["amostras"][:-120]
+
+        if precisa:
+            # captura tambem os "quase": sem eles so da para medir
+            # precisao, nunca recall - falso negativo e invisivel
+            pp = por_pessoa[i_pico] if i_pico < len(por_pessoa) else {}
+            H.revisao.guarda(
+                img, self.mid, pico, len(kpts), (t_resp - t_cap) * 1e3,
+                caixa=caixas[i_pico] if i_pico < len(caixas) else None,
+                img_limpo=img_limpo,
+                extra={"modelo": r.get("modelo"),
+                       "segurando_s": pp.get("segurando_s", 0.0),
+                       "confirmado": bool(pp.get("confirmado")),
+                       "trilha": pp.get("id")})
+        if H.registro:
+            H.registro.escreve(
+                cam=self.mid, evento="gesto" if n_g else "quadro",
+                pessoas=len(kpts), gestos=n_g,
+                t_captura=t_cap, t_envio=t_envio, t_resposta=t_resp,
+                fila_ms=round((t_envio - t_cap) * 1e3, 1),
+                ms_encode=round(ms_encode, 1),
+                ms_rede=round(ms_rede, 1),
+                ms_servidor=r.get("ms_servidor"),
+                ms_infer=r.get("ms_infer"),
+                ms_decode=r.get("ms_decode"),
+                ms_total=round(total, 1),
+                ms_captura_ate_resposta=round((t_resp - t_cap) * 1e3, 1),
+                kb=round(m["kb"], 1), modelo=r.get("modelo"),
+                temp=round(temperatura(), 1))
+        if n_g:
+            # aviso na hora, fora do laco: a rede da plataforma nao pode
+            # atrasar o proximo quadro
+            threading.Thread(
+                target=self._avisa, args=(n_g, len(kpts), t_cap, t_resp),
+                daemon=True).start()
+        q.img = None      # so agora o quadro cru pode ser liberado
 
     def _avisa(self, n_g, pessoas, t_cap, t_resp):
         a = time.time()
@@ -347,6 +594,18 @@ class Camera:
         m["ms"], m["ms_det"], m["ms_pose"] = ms, ms_det, ms_pose
         m["amostras"].append(ms)
         del m["amostras"][:-120]
+
+
+def _marcador(nome, larg, alt):
+    """JPEG cinza com o nome da camera, para o tile nunca ficar preto."""
+    img = np.full((alt, larg, 3), 26, np.uint8)
+    cv2.putText(img, nome, (14, alt // 2 - 8), cv2.FONT_HERSHEY_SIMPLEX,
+                0.6, (130, 130, 130), 1, cv2.LINE_AA)
+    cv2.putText(img, "miniatura indisponivel - tentando de novo",
+                (14, alt // 2 + 18), cv2.FONT_HERSHEY_SIMPLEX,
+                0.45, (95, 95, 95), 1, cv2.LINE_AA)
+    ok, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    return enc.tobytes() if ok else b""
 
 
 class Registro:
@@ -497,14 +756,17 @@ class Nuvem:
         self.caminho = u.path or "/"
         self.qualidade = qualidade
         self.arena, self.camera = arena, camera
-        self.conn = None
-        self.lock = threading.Lock()
+        # UMA CONEXAO POR THREAD, nao uma sob lock: com varias requisicoes em
+        # voo, um lock em volta do request/response serializaria tudo de novo
+        # e a concorrencia nao existiria. `threading.local` da a cada thread
+        # de envio a sua propria conexao keep-alive.
+        self._local = threading.local()
 
     def _liga(self):
         # Cloud Run so atende HTTPS; VM propria pode ser HTTP simples.
         cls = (http.client.HTTPSConnection if self.https
                else http.client.HTTPConnection)
-        self.conn = cls(self.host, self.porta, timeout=30)
+        self._local.conn = cls(self.host, self.porta, timeout=30)
 
     def infere(self, img):
         """-> (resultado, ms_encode, ms_rede) ou (None, ms_encode, 0)."""
@@ -515,32 +777,31 @@ class Nuvem:
         if not ok:
             return None, ms_encode, 0.0
         corpo = enc.tobytes()
-        with self.lock:
-            for tentativa in (1, 2):
+        for tentativa in (1, 2):
+            try:
+                if getattr(self._local, "conn", None) is None:
+                    self._liga()
+                a = time.perf_counter()
+                self._local.conn.request(
+                    "POST", self.caminho, body=corpo,
+                    headers={"Content-Type": "image/jpeg",
+                             "Content-Length": str(len(corpo)),
+                             # multi-tenant: o servidor separa a escala de
+                             # confianca por camera e loga por arena
+                             "X-Arena": self.arena,
+                             "X-Camera": self.camera})
+                r = json.loads(self._local.conn.getresponse().read())
+                rtt = (time.perf_counter() - a) * 1e3
+                r["_bytes"] = len(corpo)
+                return r, ms_encode, rtt - r.get("ms_servidor", 0)
+            except Exception as e:
                 try:
-                    if self.conn is None:
-                        self._liga()
-                    a = time.perf_counter()
-                    self.conn.request(
-                        "POST", self.caminho, body=corpo,
-                        headers={"Content-Type": "image/jpeg",
-                                 "Content-Length": str(len(corpo)),
-                                 # multi-tenant: o servidor separa a escala de
-                                 # confianca por camera e loga por arena
-                                 "X-Arena": self.arena,
-                                 "X-Camera": self.camera})
-                    r = json.loads(self.conn.getresponse().read())
-                    rtt = (time.perf_counter() - a) * 1e3
-                    r["_bytes"] = len(corpo)
-                    return r, ms_encode, rtt - r.get("ms_servidor", 0)
-                except Exception as e:
-                    try:
-                        self.conn.close()
-                    except Exception:
-                        pass
-                    self.conn = None
-                    if tentativa == 2:
-                        return {"erro": f"{type(e).__name__}"}, ms_encode, 0.0
+                    self._local.conn.close()
+                except Exception:
+                    pass
+                self._local.conn = None
+                if tentativa == 2:
+                    return {"erro": f"{type(e).__name__}"}, ms_encode, 0.0
         return None, ms_encode, 0.0
 
 
@@ -590,7 +851,7 @@ h1{font-size:18px;margin:0 0 4px;font-weight:600}
 .cam{background:#12151c;border:2px solid #1e222b;border-radius:10px;overflow:hidden;cursor:pointer;transition:.15s}
 .cam:hover{border-color:#4a4f5e}
 .cam.on{border-color:#7c5cff;box-shadow:0 0 0 3px rgba(124,92,255,.14)}
-.cam img{width:100%;display:block;aspect-ratio:16/10;object-fit:cover;background:#000}
+.cam img{width:100%;display:block;max-height:70vh;object-fit:contain;background:#000}
 .cam .lb{padding:8px 10px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
 .tag{font-size:11px;font-weight:700;letter-spacing:.4px}
 .tag.on{color:#7c5cff}.tag.off{color:#5a6072}
@@ -608,7 +869,9 @@ tr.alerta{animation:pisca 1s infinite}
 </style>
 <h1>Esqueletos ao vivo &mdash; 1 quadro por segundo</h1>
 <div class=sub>Clique numa camera para <b>ligar</b> a analise. So ela captura e processa &mdash;
-as outras param o ffmpeg por completo, para nao gastar CPU a toa.</div>
+as outras param o ffmpeg por completo, para nao gastar CPU a toa.<br>
+<a href="/pessoas" style="color:#7c5cff">quem levantou as maos</a> &middot;
+<a href="/revisao" style="color:#7c5cff">validar deteccoes</a></div>
 <div class=grade id=grade></div>
 
 <h2>Processamento</h2>
@@ -621,7 +884,7 @@ async function listar(){
   cams=await (await fetch('/api/cameras')).json();
   document.getElementById('grade').innerHTML=cams.map(c=>`
     <div class=cam id="c_${c.mid}" onclick="alterna('${c.mid}')">
-      <img id="i_${c.mid}" src="/quadro/${c.mid}.mjpg">
+      <img id="i_${c.mid}" src="/foto/${c.mid}.jpg">
       <div class=lb><b>${c.nome}</b><span class="tag off" id="t_${c.mid}">DESLIGADA</span></div>
     </div>`).join('');
 }
@@ -633,8 +896,7 @@ async function alterna(mid){
     const tg=document.getElementById('t_'+c.mid);
     tg.textContent=on?'ANALISANDO':'DESLIGADA';
     tg.className='tag '+(on?'on':'off');
-    // recarrega o mjpeg: a camera desligada volta a mostrar a foto parada
-    document.getElementById('i_'+c.mid).src='/quadro/'+c.mid+'.mjpg?'+Date.now();
+    pinta(c.mid);   // atualiza ja, sem esperar o proximo tique
   });
 }
 function cor(v,a,b){return v<a?'ok':v<b?'warn':'bad'}
@@ -679,6 +941,16 @@ setInterval(async()=>{
    <tr><td>throttling</td><td>${s.throttled}</td></tr>
    <tr><td>tempo ligado</td><td>${dur(s.uptime)}</td></tr>`;
 },1500);
+// Carrega fora da tela e so troca o src quando o quadro ja esta pronto:
+// atribuir direto no <img> visivel o apaga enquanto baixa, e a 1 fps isso
+// pisca. Se um GET falhar, o proximo tique conserta - e essa e a diferenca
+// para o multipart, que falhava uma vez e congelava para sempre.
+function pinta(mid){
+  const im=new Image();
+  im.onload=()=>{const el=document.getElementById('i_'+mid); if(el) el.src=im.src;};
+  im.src='/foto/'+mid+'.jpg?'+Date.now();
+}
+setInterval(()=>cams.forEach(c=>pinta(c.mid)),1000);
 listar();
 </script>"""
 
@@ -698,12 +970,170 @@ def aplica_config():
     return ligadas
 
 
+PAGINA_REVISAO = """<!doctype html><meta charset=utf-8><title>Revisao de gestos</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0b0d11;color:#e8eaed;font:14px system-ui,sans-serif;margin:0;padding:20px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:#8b93a7;font-size:13px;margin-bottom:16px}
+.res{display:flex;gap:26px;flex-wrap:wrap;background:#12151c;border:1px solid #1e222b;
+border-radius:10px;padding:14px 18px;margin-bottom:18px}
+.res div{min-width:78px}
+.res b{display:block;font-size:20px;font-weight:600}
+.res span{color:#8b93a7;font-size:12px}
+.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.ev{background:#12151c;border:2px solid #1e222b;border-radius:10px;overflow:hidden}
+.ev.sim{border-color:#4ade80}.ev.nao{border-color:#ff6b6b}
+.ev img{width:100%;display:block;background:#000;cursor:zoom-in;aspect-ratio:4/3;object-fit:cover}
+.tags{display:flex;gap:6px;padding:0 10px 6px;flex-wrap:wrap}
+.tag{font-size:10px;font-weight:700;letter-spacing:.3px;padding:2px 6px;border-radius:4px}
+.tag.conf{background:#3a1020;color:#ff6b8a}
+.tag.seg{background:#1a2436;color:#7cc4ff}
+.tag.tr{background:#1e1a2e;color:#a78bfa}
+.filtros{display:flex;gap:8px;margin-bottom:14px}
+.filtros button{background:#12151c;color:#8b93a7;border:1px solid #1e222b;border-radius:7px;
+padding:7px 14px;cursor:pointer;font-size:13px}
+.filtros button.on{border-color:#7c5cff;color:#e8eaed}
+.meta{padding:8px 10px;font-size:12px;color:#8b93a7;display:flex;justify-content:space-between}
+.m{font-weight:700}
+.m.alto{color:#7c5cff}.m.quase{color:#fbbf24}
+.bt{display:flex;gap:6px;padding:0 10px 10px}
+.bt button{flex:1;background:#1a1d24;color:#e8eaed;border:1px solid #2a2f3a;
+border-radius:6px;padding:7px;cursor:pointer;font-size:12px}
+.bt button:hover{border-color:#7c5cff}
+.bt .on-sim{background:#14361f;border-color:#4ade80}
+.bt .on-nao{background:#3a1015;border-color:#ff6b6b}
+.vazio{color:#8b93a7;padding:50px;text-align:center}
+</style>
+<h1>Revisao de gestos</h1>
+<div class=sub>Historico de quem levantou as maos, com o esqueleto desenhado.
+A foto e um <b>recorte ampliado da pessoa</b> &mdash; clique para ver o quadro inteiro.
+Marque <b>era gesto</b> ou <b>nao era</b> e o limiar sai do dado em vez de palpite.</div>
+<div class=res id=res></div>
+<div class=filtros>
+  <button id=f_tudo class=on onclick="filtra('tudo')">tudo</button>
+  <button id=f_conf onclick="filtra('conf')">so confirmados (maos levantadas)</button>
+  <button id=f_quase onclick="filtra('quase')">so os &quot;quase&quot;</button>
+</div>
+<div class=grade id=g></div>
+<script>
+let filtro='tudo';
+function filtra(f){
+  filtro=f;
+  ['tudo','conf','quase'].forEach(x=>
+    document.getElementById('f_'+x).classList.toggle('on',x===f));
+  carrega();
+}
+async function carrega(){
+  const d=await (await fetch('/api/revisao')).json();
+  const r=d.resumo;
+  document.getElementById('res').innerHTML=`
+    <div><b>${r.capturadas}</b><span>capturadas</span></div>
+    <div><b>${r.rotuladas}</b><span>rotuladas</span></div>
+    <div><b style="color:#4ade80">${r.vp}</b><span>acertos</span></div>
+    <div><b style="color:#ff6b6b">${r.fp}</b><span>falso positivo</span></div>
+    <div><b style="color:#fbbf24">${r.fn}</b><span>falso negativo</span></div>
+    <div><b>${r.precisao}%</b><span>precisao</span></div>
+    <div><b>${r.recall}%</b><span>recall</span></div>
+    <div><b>${r.f1}</b><span>F1 @ ${r.limiar}</span></div>
+    ${r.sugestao?`<div><b style="color:#7c5cff">${r.sugestao.limiar}</b><span>limiar sugerido (F1 ${r.sugestao.f1})</span></div>`:''}`;
+  let itens=d.itens;
+  if(filtro==='conf') itens=itens.filter(x=>x.confirmado);
+  if(filtro==='quase') itens=itens.filter(x=>!x.gesto);
+  document.getElementById('g').innerHTML = itens.length ? itens.map(it=>`
+    <div class="ev ${it.rotulo||''}" id="e_${it.id}">
+      <img src="/revisao/${it.id}${it.tem_recorte?'_p':''}.jpg"
+           title="clique para ver o quadro inteiro"
+           onclick="window.open('/revisao/${it.id}.jpg')">
+      <div class=tags>
+        ${it.confirmado?'<span class="tag conf">MAOS LEVANTADAS</span>':''}
+        ${it.segurando_s?`<span class="tag seg">segurou ${it.segurando_s.toFixed(0)}s</span>`:''}
+        ${it.trilha?`<span class="tag tr">#${it.trilha}</span>`:''}
+      </div>
+      <div class=meta>
+        <span>${it.cam} &middot; ${it.hora}</span>
+        <span class="m ${it.gesto?'alto':'quase'}">${it.margem.toFixed(2)}</span>
+      </div>
+      <div class=bt>
+        <button class="${it.rotulo==='sim'?'on-sim':''}" onclick="rot('${it.id}','sim')">era gesto</button>
+        <button class="${it.rotulo==='nao'?'on-nao':''}" onclick="rot('${it.id}','nao')">nao era</button>
+      </div>
+    </div>`).join('') : '<div class=vazio>nada capturado ainda</div>';
+}
+async function rot(id,v){
+  const el=document.getElementById('e_'+id);
+  const atual=el.classList.contains(v)?'':v;
+  await fetch('/api/rotular',{method:'POST',body:JSON.stringify({id,rotulo:atual})});
+  carrega();
+}
+carrega(); setInterval(carrega,10000);
+</script>"""
+
+
+PAGINA_PESSOAS = """<!doctype html><meta charset=utf-8><title>Quem levantou as maos</title>
+<style>
+*{box-sizing:border-box}
+body{background:#0b0d11;color:#e8eaed;font:14px system-ui,sans-serif;margin:0;padding:20px}
+h1{font-size:18px;margin:0 0 4px}
+.sub{color:#8b93a7;font-size:13px;margin-bottom:16px}
+.sub a{color:#7c5cff}
+.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+.p{background:#12151c;border:1px solid #1e222b;border-radius:12px;overflow:hidden}
+.p img{width:100%;display:block;aspect-ratio:3/4;object-fit:cover;background:#000;cursor:zoom-in}
+.p .i{padding:9px 11px}
+.p .q{font-weight:600;font-size:13px}
+.p .h{color:#8b93a7;font-size:12px;margin-top:2px}
+.b{display:inline-block;font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;margin-top:6px}
+.b.conf{background:#3a1020;color:#ff6b8a}
+.b.inst{background:#2a2410;color:#fbbf24}
+.filtros{display:flex;gap:8px;margin-bottom:14px;align-items:center;flex-wrap:wrap}
+.filtros button{background:#12151c;color:#8b93a7;border:1px solid #1e222b;border-radius:7px;
+padding:7px 14px;cursor:pointer;font-size:13px}
+.filtros button.on{border-color:#7c5cff;color:#e8eaed}
+.vazio{color:#8b93a7;padding:50px;text-align:center}
+</style>
+<h1>Quem levantou as maos</h1>
+<div class=sub>Foto <b>sem o esqueleto</b>, para reconhecer a pessoa. Clique para o
+quadro inteiro. &mdash; <a href="/revisao">ver com esqueleto e validar</a> &middot;
+<a href="/">cameras</a></div>
+<div class=filtros>
+  <button id=p_conf class=on onclick="fil('conf')">confirmados (segurou o gesto)</button>
+  <button id=p_tudo onclick="fil('tudo')">todos os registros</button>
+  <span id=cont class=sub style="margin:0 0 0 auto"></span>
+</div>
+<div class=grade id=g></div>
+<script>
+let f='conf';
+function fil(x){f=x;['conf','tudo'].forEach(k=>
+  document.getElementById('p_'+k).classList.toggle('on',k===x));carrega();}
+async function carrega(){
+  const d=await (await fetch('/api/revisao')).json();
+  let it=d.itens.filter(x=>x.tem_rosto);
+  if(f==='conf') it=it.filter(x=>x.confirmado);
+  document.getElementById('cont').textContent=`${it.length} registro(s)`;
+  document.getElementById('g').innerHTML= it.length ? it.map(x=>`
+    <div class=p>
+      <img src="/revisao/${x.id}_r.jpg" onclick="window.open('/revisao/${x.id}.jpg')">
+      <div class=i>
+        <div class=q>${x.cam.replace('_camera',' &middot; cam ')}</div>
+        <div class=h>${x.hora}</div>
+        <span class="b ${x.confirmado?'conf':'inst'}">${x.confirmado
+          ?'SEGUROU '+(x.segurando_s||0).toFixed(0)+'S':'INSTANTANEO'}</span>
+      </div>
+    </div>`).join('')
+    : '<div class=vazio>nenhum registro com foto ainda &mdash; as fotos comecam a partir do proximo gesto</div>';
+}
+carrega(); setInterval(carrega,8000);
+</script>"""
+
+
 class H(BaseHTTPRequestHandler):
     cams = {}
     pool = None
     cfg = {}
     conf = None
     registro = None
+    revisao = None
     alertas = []
 
     def log_message(self, *a):
@@ -723,6 +1153,34 @@ class H(BaseHTTPRequestHandler):
                                 "res": c.cam["res"]} for c in H.cams.values()])
         if self.path.startswith("/api/stats"):
             return self._json(estatisticas())
+        if self.path.startswith("/api/revisao"):
+            if H.revisao is None:
+                return self._json({"itens": [], "resumo": {}})
+            itens = [dict(x, rotulo=H.revisao.rotulos.get(x["id"], ""))
+                     for x in H.revisao.itens[:120]]
+            return self._json({"itens": itens, "resumo": H.revisao.resumo()})
+        if self.path.startswith("/revisao/") and self.path.endswith(".jpg"):
+            nome = os.path.basename(self.path)
+            cam = os.path.join(H.revisao.pasta, nome) if H.revisao else ""
+            if not cam or not os.path.exists(cam):
+                self.send_response(404); self.end_headers(); return
+            b = open(cam, "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/pessoas"):
+            b = PAGINA_PESSOAS.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
+        if self.path.startswith("/revisao"):
+            b = PAGINA_REVISAO.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers(); self.wfile.write(b); return
         if self.path.startswith("/api/alertas"):
             return self._json(list(reversed(H.alertas[-40:])))
         if self.path.startswith("/api/config"):
@@ -738,6 +1196,26 @@ class H(BaseHTTPRequestHandler):
                              if cfgmod.Config.quadra_de(c.mid) == q]}
                 for q in sorted(d["quadras"])]
             return self._json(d)
+        if self.path.startswith("/foto/"):
+            # UM JPEG, requisicao curta. O painel poda a 1 fps por polling em
+            # vez de segurar um multipart aberto: a conexao passa por
+            # cloudflared -> paramiko -> sshd, e stream longo por esse caminho
+            # congela no primeiro soluco - sem o <img> jamais reconectar.
+            mid = self.path.split("/")[-1].split(".")[0]
+            c = H.cams.get(mid)
+            if not c:
+                return self._json({"erro": "camera desconhecida"})
+            j = c.saida
+            if j is None:
+                j = _marcador(c.mid, *c.dims())
+                threading.Thread(target=c.foto, daemon=True).start()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(j)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(j)
+            return
         if self.path.startswith("/quadro/"):
             mid = self.path.split("/")[-1].split(".")[0]
             c = H.cams.get(mid)
@@ -749,14 +1227,33 @@ class H(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             try:
-                ultimo = None
+                ultimo, marca, t_ult = None, None, 0.0
                 while True:
                     j = c.saida
-                    if j is not None and j is not ultimo:
+                    if j is None:
+                        # NUNCA deixe o <img> sem primeiro quadro: sem
+                        # bytes o navegador pinta um retangulo PRETO, e
+                        # nao da para distinguir camera escura de
+                        # miniatura que falhou.
+                        if marca is None:
+                            marca = _marcador(c.mid, *c.dims())
+                            # o painel aberto conserta o proprio tile
+                            threading.Thread(target=c.foto,
+                                             daemon=True).start()
+                        j = marca
+                    # REENVIA mesmo sem mudanca. No multipart o navegador
+                    # so pinta uma parte quando chega o delimitador da
+                    # SEGUINTE. Camera ativa manda ~1 quadro/s e fecha a
+                    # anterior sozinha; camera parada mandava uma parte e
+                    # calava - a imagem ficava presa no buffer e o tile
+                    # aparecia PRETO, com o JPEG certo do lado do servidor.
+                    agora = time.time()
+                    if j is not None and (j is not ultimo
+                                          or agora - t_ult > 2.0):
                         self.wfile.write(b"--q\r\nContent-Type: image/jpeg\r\n"
                                          b"Content-Length: " + str(len(j)).encode()
                                          + b"\r\n\r\n" + j + b"\r\n")
-                        ultimo = j
+                        ultimo, t_ult = j, agora
                     time.sleep(0.3)
             except Exception:
                 pass
@@ -771,12 +1268,23 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         d = json.loads(self.rfile.read(n) or b"{}")
+        if self.path.startswith("/api/rotular"):
+            if H.revisao is None:
+                return self._json({"erro": "revisao desligada"})
+            return self._json(H.revisao.rotula(d.get("id", ""), d.get("rotulo", "")))
         if self.path.startswith("/api/config"):
             # chamada pelo OPS: {"ativo":true} | {"quadra":"campo01","valor":true}
             # | {"camera":"campo01_camera01","valor":false} | {"nuvem":"https://..."}
             H.conf.define(**{k: v for k, v in d.items()
                              if k in ("ativo", "quadra", "camera", "valor",
-                                      "nuvem", "webhook", "fps", "qualidade")})
+                                      "nuvem", "webhook", "fps", "qualidade",
+                                      "dur_gesto", "em_voo_max", "em_voo_min",
+                                      "ajuste_s")})
+            if "dur_gesto" in d:
+                # aplica nas cameras ja rodando, sem reiniciar o servico
+                H.cfg["dur_gesto"] = H.conf.d["dur_gesto"]
+                for c in H.cams.values():
+                    c.rast.dur_s = H.cfg["dur_gesto"]
             aplicada = aplica_config()
             return self._json({"ok": True, "config": H.conf.d,
                                "processando": aplicada})
@@ -817,9 +1325,15 @@ def estatisticas():
             "ms_det": m["ms_det"], "ms_pose": m["ms_pose"],
             "ms_encode": m["ms_encode"], "ms_rede": m["ms_rede"],
             "kb": m["kb"], "falhas": m["falhas"],
+            "instantaneos": m["instantaneos"], "segurando": m["segurando"],
+            "rastreio": c.rast.resumo(),
+            "cronologia": c.cron.resumo() if c.cron else None,
             "alerta": (time.time() - m["ultimo_gesto"]) < 8,
             "ocupacao": (m["ms"] / 10.0) if c.ativa else 0.0,
             "erro": c.erro,
+            # de onde le e em que tamanho: fonte (substream/principal), real
+            # (proporcao da cena), nativo (pixels lidos), analise (enviado)
+            "geometria": c.geo,
         })
         if c.ativa:
             cap_tot += m["capturados"]
@@ -871,8 +1385,15 @@ def main():
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--max-pessoas", type=int, default=0, dest="max_pessoas")
-    ap.add_argument("--largura", type=int, default=640)
-    ap.add_argument("--altura", type=int, default=400)
+    # Tamanho do quadro agora sai da propria camera (ver Camera._geometria).
+    # --largura/--altura ficam aceitos para nao quebrar unit antiga que os
+    # passe, mas nao fazem mais nada: eram eles que esticavam tudo para 16:10.
+    ap.add_argument("--largura", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--altura", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--lado-max", type=int, default=LADO_MAX, dest="lado_max",
+                    help="teto do lado maior do quadro de analise")
+    ap.add_argument("--sem-substream", action="store_true", dest="sem_substream",
+                    help="le o stream principal (so para comparar; custa ~6x CPU)")
     ap.add_argument("--fps", type=float, default=1.0)
     ap.add_argument("--nuvem", default="",
                     help="URL do endpoint remoto; vazio = inferencia local")
@@ -882,10 +1403,13 @@ def main():
                     help="URL avisada IMEDIATAMENTE quando detecta o gesto")
     ap.add_argument("--config", default=None,
                     help="json de configuracao (padrao /etc/gravae/hands-up.json)")
+    ap.add_argument("--revisao", default="gestos",
+                    help="pasta das evidencias de gesto; vazio desliga")
     ap.add_argument("--registro", default="registro.jsonl",
                     help="arquivo JSONL com todos os tempos, por quadro")
     args = ap.parse_args()
 
+    H.cfg = {}
     H.conf = cfgmod.Config(args.config)
     todas = cameras()
     H.conf.sincroniza([c["mid"] for c in todas])
@@ -897,21 +1421,35 @@ def main():
         args.webhook = H.conf.d["webhook"]
     args.fps = H.conf.d.get("fps", args.fps)
     args.qualidade = H.conf.d.get("qualidade", args.qualidade)
+    # substream ligado por padrao; `"substream": false` na config desliga
+    usa_sub = not args.sem_substream and bool(H.conf.d.get("substream", True))
+    H.cfg["dur_gesto"] = H.conf.d.get("dur_gesto", 2.0)
+    for k, padrao in (("em_voo_max", 4), ("em_voo_min", 1), ("ajuste_s", 10.0)):
+        H.cfg[k] = H.conf.d.get(k, padrao)
     sel = todas
     print(f"{len(sel)} cameras | ativo={H.conf.d['ativo']} | "
-          f"config={H.conf.caminho}", flush=True)
+          f"config={H.conf.caminho} | "
+          f"captura: {'substream' if usa_sub else 'principal'}, proporcao da "
+          f"camera, lado <= {args.lado_max}", flush=True)
 
     dev = {}
     try:
         dev = json.load(open("/etc/gravae/device.json"))
     except Exception:
         pass
-    H.cfg = {"threads": args.threads, "fps": args.fps, "nuvem": args.nuvem,
-             "t0": time.time(), "webhook": args.webhook,
-             "api_key": dev.get("shinobiApiKey", ""),
-             # `deviceId` no device.json E o serial do Raspberry - e como o
-             # OPS reconhece esta Pi, no poll e no aviso do gesto.
-             "serial": str(dev.get("deviceId", ""))}
+    # `update` e nao atribuicao: `dur_gesto` ja foi posto em H.cfg acima e as
+    # cameras leem dele ao serem criadas
+    H.cfg.update({"threads": args.threads, "fps": args.fps,
+                  "nuvem": args.nuvem, "t0": time.time(),
+                  "webhook": args.webhook,
+                  "api_key": dev.get("shinobiApiKey", ""),
+                  # `deviceId` no device.json E o serial do Raspberry - e como
+                  # o OPS reconhece esta Pi, no aviso do gesto.
+                  "serial": str(dev.get("deviceId", ""))})
+    if args.revisao:
+        H.revisao = revmod.Revisao(os.path.join(DIR, args.revisao))
+        print(f"revisao: {H.revisao.pasta} "
+              f"({len(H.revisao.itens)} evidencias) -> /revisao", flush=True)
     if args.registro:
         H.registro = Registro(os.path.join(DIR, args.registro))
         print(f"registro: {os.path.join(DIR, args.registro)}", flush=True)
@@ -936,7 +1474,7 @@ def main():
                   f"as cameras vao acumular falhas", flush=True)
         H.pool = None
         for c in sel:
-            cam = Camera(c, args.largura, args.altura, args.fps)
+            cam = Camera(c, args.lado_max, args.fps, substream=usa_sub)
             cam.nuvem = Nuvem(args.nuvem, args.qualidade,
                               arena=dev.get("shinobiGroupKey", ""),
                               camera=c["mid"])
@@ -948,7 +1486,7 @@ def main():
         print(f"pool: {args.workers} worker(s) x {args.threads} thread(s) | "
               f"{H.pool.nome} | RAM ~{args.workers * 200} MB", flush=True)
         for c in sel:
-            H.cams[c["mid"]] = Camera(c, args.largura, args.altura, args.fps)
+            H.cams[c["mid"]] = Camera(c, args.lado_max, args.fps, substream=usa_sub)
 
         def despachante():
             while True:

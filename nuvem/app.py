@@ -55,6 +55,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         return self._resp({"ok": True, "modelo": H.pipe.nome,
+                           # "retrato" so aparece se o modelo em pe estiver
+                           # na imagem - ver motor.Detector
+                           "orientacoes": sorted(H.pipe.det.variantes),
                            "revisao": os.environ.get("K_REVISION", "local")})
 
     def do_POST(self):
@@ -95,6 +98,10 @@ class H(BaseHTTPRequestHandler):
             "kpts": [[[round(float(x), 1), round(float(y), 1), round(float(c), 3)]
                       for x, y, c in k] for k in kpts],
             "modelo": H.pipe.nome,
+            # o que chegou e como foi analisado: e por aqui que se confere,
+            # de fora, se a Pi esta mandando o quadro na proporcao da camera
+            "quadro": [int(img.shape[1]), int(img.shape[0])],
+            "entrada": H.pipe.det.orientacao(*img.shape[:2]),
             "bytes_recebidos": n,
             "ms_decode": round(ms_decode, 1),
             "ms_infer": round(ms_infer, 1),

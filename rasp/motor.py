@@ -34,14 +34,16 @@ import numpy as np
 DIR = os.path.dirname(os.path.abspath(__file__))
 MODELOS = os.environ.get("MODELOS", os.path.join(DIR, "modelos"))
 
+# `entrada` e (altura, largura), e o nome do arquivo segue o mesmo padrao.
+# `retrato` e a variante em pe, OPCIONAL - ver `Detector`.
 DETECTORES = {
-    "yolo11n-256": dict(arq="yolo11n_256x416.onnx", entrada=(256, 416), thr=0.25),
+    "yolo11n-256": dict(arq="yolo11n_256x416.onnx", entrada=(256, 416), thr=0.25,
+                        retrato=dict(arq="yolo11n_416x256.onnx", entrada=(416, 256))),
     "yolo11n-224": dict(arq="yolo11n_224x352.onnx", entrada=(224, 352), thr=0.25),
     "yolo11n-256-int8": dict(arq="yolo11n_256x416_int8.onnx", entrada=(256, 416), thr=0.25),
 }
 POSES = {
     "rtmpose-s": dict(arq="rtmpose-s.onnx", entrada=(192, 256)),
-    "rtmpose-s-int8": dict(arq="rtmpose-s_int8.onnx", entrada=(192, 256)),
     "rtmpose-m": dict(arq="rtmpose-m.onnx", entrada=(192, 256)),
 }
 
@@ -94,24 +96,51 @@ def nms(caixas, scores, thr=0.45):
 
 
 class Detector:
+    """YOLO com a entrada escolhida PELA ORIENTACAO DO QUADRO.
+
+    O ONNX tem entrada fixa e o letterbox preserva a proporcao, entao a
+    geometria sai certa em qualquer caso. O que a orientacao muda e o
+    APROVEITAMENTO: quadro em pe (camera em modo "story", 9:16) numa entrada
+    deitada 416x256 ocupa ~37% da largura, e a pessoa do fundo chega pequena.
+    Na variante em pe (256x416) o mesmo quadro ocupa ~90%.
+
+    A variante em pe e OPCIONAL: sem o arquivo, todo quadro usa a deitada -
+    o comportamento anterior. O mesmo desenho do `nuvem/motor.py`.
+    """
+
     def __init__(self, nome, threads=2):
         cfg = DETECTORES[nome]
-        self.h, self.w = cfg["entrada"]
         self.thr = cfg["thr"]
-        self.s = sessao(os.path.join(MODELOS, cfg["arq"]), threads)
-        self.ent = self.s.get_inputs()[0].name
-        self.sai = [o.name for o in self.s.get_outputs()]
+        self.variantes = {"paisagem": self._carrega(cfg["arq"], cfg["entrada"], threads)}
+        em_pe = cfg.get("retrato")
+        if em_pe and os.path.exists(os.path.join(MODELOS, em_pe["arq"])):
+            self.variantes["retrato"] = self._carrega(em_pe["arq"], em_pe["entrada"],
+                                                      threads)
+        # quem lia det.h / det.w continua vendo a entrada deitada
+        self.h, self.w = cfg["entrada"]
+
+    @staticmethod
+    def _carrega(arq, entrada, threads):
+        s = sessao(os.path.join(MODELOS, arq), threads)
+        return {"s": s, "h": entrada[0], "w": entrada[1],
+                "ent": s.get_inputs()[0].name,
+                "sai": [o.name for o in s.get_outputs()]}
+
+    def orientacao(self, h, w):
+        """Qual variante um quadro h x w usa."""
+        return "retrato" if h > w and "retrato" in self.variantes else "paisagem"
 
     def __call__(self, bgr):
         h, w = bgr.shape[:2]
-        r = min(self.h / h, self.w / w)
+        v = self.variantes[self.orientacao(h, w)]
+        r = min(v["h"] / h, v["w"] / w)
         nw, nh = int(w * r), int(h * r)
-        tela = np.full((self.h, self.w, 3), 114, np.uint8)
+        tela = np.full((v["h"], v["w"], 3), 114, np.uint8)
         tela[:nh, :nw] = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(tela, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         blob = np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
 
-        pred = self.s.run(self.sai, {self.ent: blob})[0][0].T   # (A, 4+nc)
+        pred = v["s"].run(v["sai"], {v["ent"]: blob})[0][0].T   # (A, 4+nc)
         conf = pred[:, 4]                                       # classe 0 = pessoa
         fica = conf > self.thr
         if not fica.any():
@@ -199,6 +228,35 @@ class Pipeline:
         return caixas, kpts
 
 
+def gesto_margem(k, conf_min=0.3, escala_conf=1.0):
+    """Quanto o gesto esta ACIMA ou ABAIXO do criterio, em larguras de ombro.
+
+    O criterio original devolve sim/nao, o que joga fora a informacao mais
+    util para calibrar: o quanto faltou. Aqui a saida e continua -
+
+        >= 0,35  gesto (o limiar atual)
+        0,15..0,35  quase: e o que revela falso NEGATIVO na revisao
+        < 0,15   nao e gesto
+
+    O valor e o MENOR dos dois lados, porque o criterio exige os dois bracos.
+    Devolve None quando nem da para avaliar (confianca baixa ou ombros
+    colados, que e o caso da pessoa de perfil).
+    """
+    c = k[:, 2] / max(escala_conf, 1e-6)
+    if min(c[[5, 6, 7, 8, 9, 10]]) < conf_min:
+        return None
+    larg = float(np.linalg.norm(k[5, :2] - k[6, :2]))
+    if larg < 1.0:
+        return None
+    # cotovelo acima do ombro e condicao dura: sem ela, aceno com a mao na
+    # altura da cabeca passaria por braco levantado
+    if not (k[7, 1] < k[5, 1] and k[8, 1] < k[6, 1]):
+        return -1.0
+    esq = (k[5, 1] - k[9, 1]) / larg
+    dir = (k[6, 1] - k[10, 1]) / larg
+    return float(min(esq, dir))
+
+
 def gesto_bracos(k, margem=0.35, conf_min=0.3, escala_conf=1.0):
     """punho.y < ombro.y - margem*largura_ombros nos dois lados, e cotovelo
     acima do ombro. Exigir o cotovelo separa braco levantado de aceno com a
@@ -214,12 +272,34 @@ def gesto_bracos(k, margem=0.35, conf_min=0.3, escala_conf=1.0):
                 k[7, 1] < k[5, 1] and k[8, 1] < k[6, 1])
 
 
-def desenha(img, caixas, kpts, conf_min=0.3, escala_conf=1.0, gestos=None):
+def cor_trilha(tid):
+    """Cor estavel e distinta por id de trilha.
+
+    O angulo aureo (137,508 graus) espalha matizes consecutivos o mais longe
+    possivel no circulo de cores - trilhas #7 e #8 saem visualmente diferentes,
+    o que nao aconteceria com um passo fixo. Saturacao e valor altos porque a
+    quadra e clara e cor pastel some no fundo.
+
+    Cor no lugar do numero: identidade se le de relance. Se a caixa de uma
+    pessoa parada troca de cor entre quadros, o rastreio a perdeu - e isso
+    salta aos olhos sem precisar ler nada.
+    """
+    h = int((tid * 137.508) % 180)          # OpenCV usa H em 0..179
+    bgr = cv2.cvtColor(np.uint8([[[h, 235, 255]]]), cv2.COLOR_HSV2BGR)
+    return tuple(int(v) for v in bgr[0][0])
+
+
+def desenha(img, caixas, kpts, conf_min=0.3, escala_conf=1.0, gestos=None,
+            trilhas=None):
     for i, k in enumerate(kpts):
         ativo = gestos[i] if gestos else False
-        cor = (60, 60, 240) if ativo else (80, 230, 80)
+        # a COR e a identidade da pessoa; a ESPESSURA e o estado do gesto.
+        # Dois canais separados: trocar de cor denuncia rastreio perdido,
+        # engrossar mostra gesto confirmado - e um nao esconde o outro.
+        cor = (cor_trilha(trilhas[i]) if trilhas and i < len(trilhas)
+               else ((60, 60, 240) if ativo else (80, 230, 80)))
         x1, y1, x2, y2 = [int(v) for v in caixas[i]]
-        cv2.rectangle(img, (x1, y1), (x2, y2), cor, 2 if ativo else 1)
+        cv2.rectangle(img, (x1, y1), (x2, y2), cor, 3 if ativo else 1)
         c = k[:, 2] / max(escala_conf, 1e-6)
         for a, b in ESQUELETO:
             if c[a] >= conf_min and c[b] >= conf_min:
@@ -229,6 +309,12 @@ def desenha(img, caixas, kpts, conf_min=0.3, escala_conf=1.0, gestos=None):
             if c[j] >= conf_min:
                 cv2.circle(img, (int(k[j, 0]), int(k[j, 1])), 3, (255, 255, 255), -1)
         if ativo:
-            cv2.putText(img, "BRACOS LEVANTADOS", (x1, max(y1 - 8, 14)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 240), 2)
+            # fundo solido atras do texto: sobre a quadra clara, texto colorido
+            # sem contraste fica ilegivel justamente no quadro que importa
+            txt = "BRACOS LEVANTADOS"
+            (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+            cv2.rectangle(img, (x1, max(y1 - th - 12, 0)),
+                          (x1 + tw + 8, max(y1 - 4, th + 8)), cor, -1)
+            cv2.putText(img, txt, (x1 + 4, max(y1 - 9, th + 2)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (20, 20, 20), 2)
     return img

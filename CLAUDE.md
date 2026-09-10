@@ -21,7 +21,7 @@ Exigir o **cotovelo** é o que separa braço levantado de aceno na altura da
 cabeça. A régua de escala é a largura de ombros, não o torso — torso não
 existe em enquadramento de meio corpo.
 
-## As três invariantes que não se quebram
+## As quatro invariantes que não se quebram
 
 **1. O gargalo é térmico, não CPU.** A Pi de arena fica em **72 °C parada**,
 com o Shinobi rodando. O throttling começa aos 80 °C. Com quatro capturas
@@ -29,13 +29,35 @@ locais chegou a **84,7 °C** e o *mesmo modelo* passou de 193 para **1.948 ms**
 — 10× mais lento por calor. Antes de propor "roda mais coisa na Pi", olhe a
 temperatura.
 
-**2. A captura é a segunda coisa mais cara.** O stream principal das câmeras é
-**1280×720@30**, mesmo quando o Shinobi reporta 640×480 (campo diferente). Com
-`-vf fps=1` o ffmpeg decodifica tudo e joga 29 de cada 30 fora: **~27% de um
-núcleo por câmera**. Por isso a captura só roda em câmera ligada.
+**2. A captura é a segunda coisa mais cara — por isso lê o substream.** Com
+`-vf fps=1` o ffmpeg decodifica tudo e joga 29 de cada 30 fora, então o custo é
+o do stream inteiro. Com o principal a 1280×720 eram ~27% de um núcleo por
+câmera. As câmeras em modo "story" subiram para **1440×2560** e o principal foi
+a **61%** (medido na CTF Marcelinho, Pi 4); o **substream** da mesma câmera
+(480×704, H.265) custa **10%**. O Shinobi reporta 640×480 nos dois casos — é
+outro campo, não confie nele. A captura só roda em câmera ligada.
+
+**2b. A geometria vem da câmera, nunca de constante.** O quadro era esticado
+para 640×400 fixo. Quando as câmeras viraram para 9:16, cada pessoa passou a
+chegar **achatada 2,84× na vertical** e o detector deixou de achar gente (num
+quadro real com 2 jogadores na rede: 0 pessoas). A proporção sai do stream
+**principal**, porque o substream é **anamórfico e não declara**: 480×704 para
+uma cena 9:16, pixels 21% mais largos, `sample_aspect_ratio=N/A`. Os pixels
+saem do substream reamostrados para a proporção real (396×704), e isso é refeito
+a cada reconexão. A nuvem escolhe a entrada do YOLO pela orientação do quadro
+(`yolo11s_640x416.onnx` em pé; sem ele, cai na deitada).
 
 **3. Nada nasce ligado.** Uma atualização que chega em centenas de Raspberries
 não pode começar a consumir CPU e banda sozinha. O operador liga pelo OPS.
+
+**4. O relógio do rastreio é a CAPTURA, nunca a resposta.** A inferência
+mora na nuvem e a latência varia de **400 a 3.420 ms**. Se o rastreio for
+alimentado com o instante em que a resposta chegou, o `segurando_s` do gesto
+mede jitter de rede em vez do tempo real da pessoa — e com várias requisições
+em voo ele chega a andar para trás. `rast.passo(..., agora=q.t_captura)`. Pela
+mesma razão, resultado que volta fora de ordem é **reordenado antes** de tocar
+o rastreio (`cronologia.py`), e resultado que chega depois do seu lugar é
+descartado: melhor perder um quadro que corromper o estado temporal.
 
 ## Dois eixos independentes (isto foi medido, não suposto)
 
@@ -84,6 +106,9 @@ o que só ela mede.
 | Phoenix enfileira alertas | aviso do gesto chega até 5 min depois | `WEBHOOK_SEND_INTERVAL = 300`; por isso o POST do gesto é **direto** |
 | Quantização INT8 na Pi 4 | ganho não aparece | Cortex-A72 é ARMv8.0 e **não tem `asimddp`** (SDOT/UDOT chegaram no ARMv8.2). Só vale em Pi 5 |
 | `*-pose` one-stage como referência | acha metade das pessoas | `yolo11x-pose` dá 1,97 onde `yolo11x` dá 4,39 — a cabeça de pose suprime quem não consegue posar |
+| câmera virada para 9:16 ("story") | detecção para, sem erro nenhum | `scale=640:400` fixo achatava a pessoa 2,84×; ver invariante 2b |
+| substream "direto" | pessoa 21% mais larga | substream anamórfico sem `sample_aspect_ratio`; a proporção tem de vir do principal |
+| miniatura com câmera ligada | RTSP `403 Forbidden` | a câmera recusa a sessão a mais no stream principal; a miniatura sai do substream |
 
 ## Acesso às Raspberries
 

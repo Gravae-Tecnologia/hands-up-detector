@@ -30,6 +30,21 @@ done
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 t0=$(date +%s)
 
+# O usuario do servico NAO e fixo. As Pis da Gravae tem `gravae`; as da
+# Replayme tem `replayme` e NAO tem `gravae` — medido em 29/08/2026: 188 dos
+# 893 dispositivos da frota. Com `set -e`, um `chown` num usuario inexistente
+# aborta o instalador inteiro, entao o parque inteiro da Replayme falharia na
+# primeira linha que toca dono de arquivo.
+USUARIO=""
+for u in gravae replayme "${SUDO_USER:-}"; do
+  if [ -n "$u" ] && id "$u" >/dev/null 2>&1; then USUARIO="$u"; break; fi
+done
+if [ -z "$USUARIO" ]; then
+  echo "ERRO: nenhum usuario de servico encontrado (gravae, replayme ou SUDO_USER)" >&2
+  exit 1
+fi
+echo "==> usuario do servico: $USUARIO"
+
 echo "==> dependencias do sistema"
 NEED=""
 python3 -c "import cv2" 2>/dev/null || NEED="$NEED python3-opencv"
@@ -42,9 +57,10 @@ fi
 
 echo "==> codigo em $DESTINO"
 sudo mkdir -p "$DESTINO"
-sudo cp "$DIR"/servico.py "$DIR"/motor.py "$DIR"/config.py "$DESTINO/"
+# copia todos os modulos: esquecer um so aparece no boot do servico
+sudo cp "$DIR"/*.py "$DESTINO/"
 [ "$MODO" = local ] && sudo cp -r "$DIR/modelos" "$DESTINO/"
-sudo chown -R gravae:gravae "$DESTINO"
+sudo chown -R "$USUARIO:$USUARIO" "$DESTINO"
 
 echo "==> venv"
 if [ ! -x "$DESTINO/venv/bin/python" ]; then
@@ -76,16 +92,19 @@ json.dump(d, open(p, "w"), indent=2)
 print("    nuvem/webhook atualizados")
 PY
 fi
-sudo chown gravae:gravae /etc/gravae/hands-up.json
-# o servico roda como `gravae` e a config e salva por troca atomica, o que
+sudo chown "$USUARIO:$USUARIO" /etc/gravae/hands-up.json
+# o servico roda como $USUARIO e a config e salva por troca atomica, o que
 # exige criar um .tmp no diretorio. Dono continua root (o agente escreve o
 # device.json por la); so o grupo ganha escrita.
-sudo chgrp gravae /etc/gravae && sudo chmod g+w /etc/gravae
+sudo chgrp "$USUARIO" /etc/gravae && sudo chmod g+w /etc/gravae
 sudo touch /var/log/gravae-hands-up.log
-sudo chown gravae:gravae /var/log/gravae-hands-up.log
+sudo chown "$USUARIO:$USUARIO" /var/log/gravae-hands-up.log
 
 echo "==> servico"
-sudo cp "$DIR/gravae-hands-up.service" /etc/systemd/system/
+# `User=` sai do arquivo do repo e vira o usuario detectado: unit com dono
+# inexistente sobe e morre em loop, sem erro no instalador.
+sudo sed "s/^User=.*/User=$USUARIO/" "$DIR/gravae-hands-up.service" \
+  | sudo tee /etc/systemd/system/gravae-hands-up.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable -q gravae-hands-up
 sudo systemctl restart gravae-hands-up
