@@ -10,7 +10,7 @@ esticados 21% na horizontal, sem `sample_aspect_ratio` declarado.
 from __future__ import annotations
 
 import motor
-from servico import dimensoes_analise, url_principal, url_substream
+from servico import dimensoes_analise, dims_do_stream, url_principal, url_substream
 
 
 def ok(cond, msg):
@@ -79,9 +79,24 @@ def teste_nunca_aumenta():
            f"real {real} lido {nat} -> {w}x{h}")
 
 
+def teste_ffprobe():
+    print("6. leitura do ffprobe: 4.x (Debian 11) e 5+")
+    ok(dims_do_stream({"width": 1080, "height": 1920}) == (1080, 1920),
+       "Fit Club, ffprobe 4.3: HEVC 1080x1920 sem rotacao")
+    ok(dims_do_stream({"width": 1920, "height": 1080, "tags": {"rotate": "90"}})
+       == (1080, 1920), "rotacao na tag `rotate` (formato do 4.x)")
+    ok(dims_do_stream({"width": 1920, "height": 1080,
+                       "side_data_list": [{"rotation": -90}]}) == (1080, 1920),
+       "rotacao em side_data_list (formato do 5+)")
+    ok(dims_do_stream({"width": 1920, "height": 1080, "tags": {"rotate": "180"}})
+       == (1920, 1080), "180 graus nao troca os lados")
+    ok(dims_do_stream({"width": 0, "height": 0}) is None and dims_do_stream(None) is None,
+       "stream sem dimensao: None, nunca excecao")
+
+
 # ------------------------------------------------------------- detector
 def teste_orientacao():
-    print("6. detector escolhe a entrada pela orientacao do quadro")
+    print("7. detector escolhe a entrada pela orientacao do quadro")
     d = motor.Detector.__new__(motor.Detector)
     d.variantes = {"paisagem": {}, "retrato": {}}
     ok(d.orientacao(704, 396) == "retrato", "quadro em pe -> variante em pe")
@@ -93,6 +108,6 @@ def teste_orientacao():
 
 if __name__ == "__main__":
     for f in (teste_url, teste_ctf, teste_sem_substream, teste_paisagem,
-              teste_nunca_aumenta, teste_orientacao):
+              teste_nunca_aumenta, teste_ffprobe, teste_orientacao):
         f()
     print("\ntodos passaram")
