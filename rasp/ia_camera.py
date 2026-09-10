@@ -51,6 +51,14 @@ CARENCIA_S = 30
 #: Timeout de leitura do stream de eventos. A batida vem a cada ~5 s; quatro
 #: perdidas seguidas e a conexao esta morta mesmo sem o TCP ter percebido.
 LEITURA_S = 20
+#: Pessoa vista pelo NOSSO detector so renova o prazo se for CONSISTENTE:
+#: tantos quadros com gente dentro da janela. Medido no Fit Club (10/09,
+#: quadras vazias, 1 fps): 6 quadros isolados com "1 pessoa" em 3 min, nunca
+#: dois seguidos. Sem o filtro, um falso positivo a cada 10 min seguraria a
+#: quadra vazia ligada para sempre. Jogador de verdade aparece em quase todo
+#: quadro; quem passa atras da quadra por alguns segundos tambem conta.
+DETECTOR_MIN_QUADROS = 3
+DETECTOR_JANELA_S = 10.0
 #: Com que frequencia reconfirmar o que a camera oferece.
 RESONDA_OK_S = 6 * 3600       # ja sabemos a resposta: so para pegar mudanca
 RESONDA_FALHA_S = 300         # camera nao respondeu: tenta de novo logo
@@ -115,6 +123,7 @@ class Presenca:
         self.caiu_em = t            # sem conexao desde
         self.visto = {}             # fonte -> instante da ultima pessoa vista
         self.contagem = {}          # fonte -> quantas vezes
+        self._acertos = []          # quadros do detector com gente, na janela
 
     # -- o que chega da camera
     def evento(self, acao, indice, agora):
@@ -159,6 +168,20 @@ class Presenca:
                 self.caiu_em = agora
 
     # -- o que chega do nosso detector
+    def detector(self, agora):
+        """Um quadro analisado COM gente. `agora` e o instante da captura, e os
+        quadros chegam em ordem (a Cronologia garante). So renova o prazo com
+        `DETECTOR_MIN_QUADROS` dentro de `DETECTOR_JANELA_S`; os isolados sao
+        contados a parte, para dar para ver quanto falso positivo houve."""
+        with self.lock:
+            self._acertos = [t for t in self._acertos
+                             if agora - t <= DETECTOR_JANELA_S] + [agora]
+            if len(self._acertos) >= DETECTOR_MIN_QUADROS:
+                self._viu(agora, "detector")
+            else:
+                self.contagem["detector_isolado"] = (
+                    self.contagem.get("detector_isolado", 0) + 1)
+
     def viu(self, agora, fonte="detector"):
         with self.lock:
             self._viu(agora, fonte)

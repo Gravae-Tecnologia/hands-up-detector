@@ -580,10 +580,12 @@ class Camera:
         caixas = np.array(r.get("caixas", []), np.float32).reshape(-1, 4)
         # Gente vista pelo detector tambem segura o gatilho "ia": a camera so
         # avisa MOVIMENTO humano, e quem esta parado conversando entre dois
-        # games nao gera evento. O relogio e a captura (invariante 4).
+        # games nao gera evento. So conta se for consistente (3 quadros em
+        # 10 s, ver ia_camera.DETECTOR_MIN_QUADROS) - acerto isolado e falso
+        # positivo. O relogio e a captura (invariante 4).
         pres = self.presenca
         if pres is not None and (len(caixas) or kpts):
-            pres.viu(t_cap, "detector")
+            pres.detector(t_cap)
         # margem continua por pessoa: e o que permite recalibrar o limiar
         # depois sem recapturar nada
         margens = [motor.gesto_margem(k) for k in kpts]

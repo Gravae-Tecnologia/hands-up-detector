@@ -56,7 +56,8 @@ foi); o `ia` só entra quando o OPS escolhe.
 "ia"`, a câmera Intelbras avisa gente (`SmartMotionHuman`, por uma conexão
 HTTP que a Pi mantém aberta) e a captura pausa 10 min depois da última pessoa.
 A câmera só vê **movimento** humano — por isso as pessoas que o nosso detector
-vê também renovam o prazo. Tudo que é dúvida vira "tem gente": câmera sem IA,
+vê também renovam o prazo, mas só se forem consistentes (3 quadros em 10 s):
+falso positivo isolado a cada 10 min seguraria a quadra vazia ligada para sempre. Tudo que é dúvida vira "tem gente": câmera sem IA,
 IA desligada nela, sonda sem resposta, conexão caída há mais de 30 s, serviço
 que acabou de subir. O contrário — pausar na dúvida — deixaria o hands-up
 dormindo sem ninguém perceber, porque sem evento nada acorda. A regra inteira é
