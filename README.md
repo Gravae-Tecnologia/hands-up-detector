@@ -101,6 +101,8 @@ curl -XPOST localhost:8090/api/config -d '{"sondar_ia":true}'      # pergunta à
   chega na hora, com uma batida a cada ~5 s.
 - **Pausa 10 min depois da última pessoa**, vista pela câmera ou pelo nosso
   detector (a câmera só vê *movimento* humano; quem está parado ela não avisa).
+  Do detector só vale gente **consistente** — 3 quadros em 10 s: numa quadra
+  vazia do Fit Club ele deu 6 quadros isolados com "1 pessoa" em 3 min.
 - **Na dúvida, fica ativa:** câmera sem IA, com a detecção de humano desligada
   nela, que não respondeu, ou com a conexão caída há mais de 30 s.
 

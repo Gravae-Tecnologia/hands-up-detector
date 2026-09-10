@@ -78,6 +78,25 @@ def teste_presenca():
     ok(est["eventos"] == {"camera": 2, "detector": 1}, f"contagem por fonte {est['eventos']}")
 
 
+def teste_detector():
+    print("2b. nosso detector: so gente CONSISTENTE renova o prazo")
+    t = 0.0
+    p = ia.Presenca(espera_s=600, carencia_s=30, agora=t)
+    p.conectou(t + 1)
+    # os acertos isolados medidos no Fit Club com a quadra 03 vazia
+    # (16:01:05, 16:02:07, 16:03:03, 16:03:16), ja depois do prazo inicial
+    for dt in (605, 667, 723, 736):
+        p.detector(t + dt)
+    ok(not p.tem_gente(t + 740),
+       "quadros isolados com '1 pessoa' nao seguram a quadra vazia")
+    ok(p.contagem.get("detector_isolado") == 4 and "detector" not in p.contagem,
+       f"mas ficam contados: {p.contagem}")
+    for k in range(3):                              # jogador: 3 quadros seguidos
+        p.detector(t + 800 + k)
+    ok(p.tem_gente(t + 1401) and not p.tem_gente(t + 1403),
+       "3 quadros em 10 s: renova o prazo a partir do terceiro")
+
+
 def teste_presenca_conexao():
     print("3. conexao com a camera: na duvida, tem gente")
     t = 0.0
@@ -332,6 +351,7 @@ def teste_servico(porta):
 if __name__ == "__main__":
     teste_interpreta()
     teste_presenca()
+    teste_detector()
     teste_presenca_conexao()
     teste_decide()
     srv, porta = sobe_camera()
