@@ -48,6 +48,14 @@ class Config:
             "em_voo_max": 4,
             "em_voo_min": 1,
             "ajuste_s": 10.0,
+            # Quem acorda a captura de uma camera ligada (ver ia_camera.py):
+            #   "manual" - fica sempre ativa (o comportamento de sempre)
+            #   "ia"     - so com gente em quadra, avisada pela IA da camera;
+            #              pausa `espera_ia_s` depois da ultima pessoa vista.
+            # "manual" por padrao pela invariante 3: atualizar o codigo nao
+            # muda o comportamento de nenhuma arena; quem escolhe e o OPS.
+            "gatilho": "manual",
+            "espera_ia_s": 600,
             "quadras": {},        # {"campo01": true}
             "cameras": {},        # {"campo01_camera01": true}
             # URL do /api/hands-up/config do OPS. Quando preenchida, os
@@ -115,6 +123,19 @@ class Config:
                     self.d[k] = v
         self.salva()
         return self.d
+
+    @staticmethod
+    def valida_gatilho(d):
+        """Erro legivel para o OPS, ou None. Valor fora disto nao e gravado:
+        um gatilho desconhecido deixaria a camera num estado que ninguem
+        sabe desenhar."""
+        if "gatilho" in d and d["gatilho"] not in ("manual", "ia"):
+            return "gatilho deve ser 'manual' ou 'ia'"
+        if "espera_ia_s" in d:
+            v = d["espera_ia_s"]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not 60 <= v <= 3600:
+                return "espera_ia_s deve ser um numero entre 60 e 3600"
+        return None
 
     def sincroniza(self, mids):
         """Cria as entradas que faltam (camera nova na arena) sem apagar as

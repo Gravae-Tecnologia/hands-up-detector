@@ -49,6 +49,18 @@ a cada reconexão. A nuvem escolhe a entrada do YOLO pela orientação do quadro
 
 **3. Nada nasce ligado.** Uma atualização que chega em centenas de Raspberries
 não pode começar a consumir CPU e banda sozinha. O operador liga pelo OPS.
+Vale também para o gatilho: o padrão é `manual` (sempre ativa, como sempre
+foi); o `ia` só entra quando o OPS escolhe.
+
+**3b. O gatilho pela IA erra para o lado de ficar ligado.** Com `"gatilho":
+"ia"`, a câmera Intelbras avisa gente (`SmartMotionHuman`, por uma conexão
+HTTP que a Pi mantém aberta) e a captura pausa 10 min depois da última pessoa.
+A câmera só vê **movimento** humano — por isso as pessoas que o nosso detector
+vê também renovam o prazo. Tudo que é dúvida vira "tem gente": câmera sem IA,
+IA desligada nela, sonda sem resposta, conexão caída há mais de 30 s, serviço
+que acabou de subir. O contrário — pausar na dúvida — deixaria o hands-up
+dormindo sem ninguém perceber, porque sem evento nada acorda. A regra inteira é
+`ia_camera.decide`, pura e testada.
 
 **4. O relógio do rastreio é a CAPTURA, nunca a resposta.** A inferência
 mora na nuvem e a latência varia de **400 a 3.420 ms**. Se o rastreio for
@@ -109,6 +121,9 @@ o que só ela mede.
 | câmera virada para 9:16 ("story") | detecção para, sem erro nenhum | `scale=640:400` fixo achatava a pessoa 2,84×; ver invariante 2b |
 | substream "direto" | pessoa 21% mais larga | substream anamórfico sem `sample_aspect_ratio`; a proporção tem de vir do principal |
 | miniatura com câmera ligada | RTSP `403 Forbidden` | a câmera recusa a sessão a mais no stream principal; a miniatura sai do substream |
+| esperar a câmera chamar a Pi | nenhum evento chega | as Intelbras do parque têm `SupportAlarmServer=false`: não fazem POST para fora. É a Pi que abre o `eventManager.cgi?action=attach` e fica ouvindo |
+| evento de humano "parou" com gente em quadra | pausa no meio do jogo | `SmartMotionHuman` é movimento; quem está parado não gera evento. O prazo de 10 min + as pessoas vistas pelo detector seguram |
+| linha do evento com `data={` | parser quebra no JSON | cada evento vem seguido de um JSON de várias linhas (hora, UTC, nome); só a linha `Code=` interessa |
 
 ## Acesso às Raspberries
 

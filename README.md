@@ -80,6 +80,34 @@ mesma estiverem ligadas.
 O `GET /api/config` devolve `quadras_detalhe`, já no formato que o OPS precisa
 para desenhar os switches.
 
+### Só com gente em quadra (gatilho pela IA da câmera)
+
+Câmera ligada captura o dia inteiro, com a quadra vazia ou não. As Intelbras da
+linha **-IA** (ex. VIP-3430-D-IA) detectam humano sozinhas; com o gatilho `ia`,
+a Pi só captura — e só paga a nuvem — enquanto há gente:
+
+```bash
+curl -XPOST localhost:8090/api/config -d '{"gatilho":"ia"}'        # ou "manual" (padrão)
+curl -XPOST localhost:8090/api/config -d '{"espera_ia_s":600}'     # 60..3600, padrão 10 min
+curl -XPOST localhost:8090/api/config -d '{"sondar_ia":true}'      # pergunta às câmeras de novo
+```
+
+- **A Pi descobre sozinha quais câmeras têm IA.** No arranque, sem nada ligado,
+  ela pergunta a cada câmera (`getDeviceType`, `getExposureEvents`,
+  `SmartMotionDetect`); o resultado vai em `quadras_detalhe[].cameras[].ia` e o
+  total em `ia_resumo`. Refaz a cada 6 h (5 min se a câmera não respondeu).
+- **A câmera avisa, a Pi não fica perguntando.** Uma conexão HTTP longa
+  (`eventManager.cgi?action=attach`) por câmera; o evento `SmartMotionHuman`
+  chega na hora, com uma batida a cada ~5 s.
+- **Pausa 10 min depois da última pessoa**, vista pela câmera ou pelo nosso
+  detector (a câmera só vê *movimento* humano; quem está parado ela não avisa).
+- **Na dúvida, fica ativa:** câmera sem IA, com a detecção de humano desligada
+  nela, que não respondeu, ou com a conexão caída há mais de 30 s.
+
+Cada câmera traz `modo` — `desligada`, `manual`, `sem_ia`, `gente`,
+`sem_sinal`, `pausada` (legenda em `modos`) — e `gatilho_ia_s`, o tempo ativa ×
+pausada desde que o serviço subiu.
+
 ### Serviço
 
 Roda sob systemd (`gravae-hands-up.service`), com `Restart=always`,
@@ -577,7 +605,7 @@ hoje, se a internet cai, não há detecção nenhuma.
 
 | pasta | roda onde | o que tem |
 |---|---|---|
-| `rasp/` | Raspberry da arena | `servico.py` (captura, painel, alerta), `motor.py` (ONNX puro), `cronologia.py` (ordem), `rastreio.py`, `revisao.py`, `config.py` |
+| `rasp/` | Raspberry da arena | `servico.py` (captura, painel, alerta), `ia_camera.py` (gatilho pela IA da câmera), `motor.py` (ONNX puro), `cronologia.py` (ordem), `rastreio.py`, `revisao.py`, `config.py` |
 | `nuvem/` | Cloud Run (CPU, sem GPU) | `app.py` (endpoint), `Dockerfile` (~400 MB, sem torch) |
 | `ferramentas/` | máquina do time | acesso via Cloudflare Tunnel, encaminhamento de porta |
 
@@ -589,4 +617,6 @@ Testes que rodam sem rede e sem câmera:
 cd rasp
 python teste_cronologia.py     # ordem, falha, resposta pendurada, controlador
 python teste_integracao.py     # gesto contínuo com latência alternada 0,4/3,4 s
+python teste_aspecto.py        # geometria da captura (câmera 9:16, substream)
+python teste_gatilho.py        # gatilho pela IA, contra uma câmera falsa em localhost
 ```
