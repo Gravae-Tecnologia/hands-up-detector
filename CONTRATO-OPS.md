@@ -23,7 +23,7 @@ OPS ──HTTPS──> agent da arena (:8888, pelo túnel) ──localhost──
 
 | peça | versão mínima | por quê |
 |---|---|---|
-| detector | `c5c4be8` (hands-up-detector#9, #10, #11) | gatilho, sonda de IA, `versao`, ffprobe do Debian 11 |
+| detector | `11a800d` (hands-up-detector#9 a #12) | gatilho, sonda de IA, `versao`, ffprobe do Debian 11, filtro de falso positivo |
 | agent | **3.7.9** (patch pendente, ver o fim) | repassar `gatilho`/`espera_ia_s`/`sondar_ia` no `apply` |
 
 A **leitura** já funciona com o agent atual (3.7.x): o status repassa o
@@ -100,7 +100,7 @@ Por câmera, em `quadras[].cameras[]` (mesma lista de sempre, com campos novos):
 ## Tela sugerida
 
 ```
-Hands-up · Arena exemplo (parque misto)                 versão c5c4be8
+Hands-up · Arena exemplo (parque misto)                 versão 11a800d
 Ativação  ( ) Manual: sempre ativa
           (•) Automática: só com gente em quadra        3 de 3 câmeras com IA
               pausa depois de [10] min sem ninguém       [Testar câmeras]
@@ -123,8 +123,9 @@ Economia hoje: 64% do tempo pausado
   respondeu à sonda, conexão caída há mais de 30 s ou serviço recém-reiniciado:
   fica ativa.
 - **Câmera vendo gente acorda na hora.** O evento chega por uma conexão HTTP
-  que a Pi mantém aberta. Do evento até o primeiro quadro analisado, a
-  captura leva alguns segundos para subir.
+  que a Pi mantém aberta. Do evento até o primeiro quadro analisado, ~6 s
+  (medido no Fit Club: 4,6 s até o primeiro quadro capturado, 5,3 s até o
+  primeiro analisado, mais até 1 s do laço).
 - **A câmera só vê movimento.** Quem fica parado não gera evento. As pessoas
   que o detector do hands-up enxerga também renovam o prazo, desde que
   apareçam de forma consistente (3 quadros em 10 s). Um falso positivo

@@ -282,3 +282,37 @@ o tempo de rede inteiro.
 O ritmo alvo estava em exatamente `1/fps`. O ffmpeg entrega a **~0,98 s**, então
 o quadro chegava "cedo" e era recusado. O piso virou **`0,85/fps`**. Vale para
 qualquer portão de tempo neste projeto: o relógio da fonte não é o seu.
+
+## 10. Gatilho pela IA da câmera — Fit Club (Pi 4, 10/09/2026)
+
+Três Intelbras VIP-3430-D-IA, em pé (1080×1920 e 1440×2560), substream HEVC
+480×704 a 30 fps, quadro de análise 396×704. `gatilho: "ia"`, prazo de 600 s.
+
+**A câmera.** 170 s ouvindo as três antes de instalar: nenhuma derrubou a
+conexão, batida a cada ~4,7 s. Na quadra com gente, `Start`/`Stop` a cada
+10–50 s (ciclos de 8 a 38 s). Nas vazias, só batida. Sonda de IA: 1,5–2,0 s
+por câmera.
+
+**A pausa, de verdade:**
+
+| quadra | última pessoa | pausou | quem viu a última pessoa |
+|---|---|---|---|
+| 01 | 16:15:53 | 16:25:53 | câmera (7 eventos) e detector (69 renovações) |
+| 02 | 16:16:12 | 16:26:12 | câmera (2) e detector (3) |
+| 03 | 16:18:02 | 16:28:02 | **só o detector** (65): pessoa parada no fundo, a câmera nunca avisou |
+
+A quadra 03 é o caso que justifica o detector renovar o prazo: a câmera só vê
+**movimento**. E o filtro de consistência (3 quadros em 10 s) barrou 13, 13 e
+35 quadros isolados — sem ele, nenhuma das três teria pausado.
+
+**Acordar.** Da ordem de ligar até o primeiro quadro capturado, **4,6 s**; até
+o primeiro analisado pela nuvem, **5,2–5,3 s** (duas rodadas). Somando o laço
+de 1 s, ~6 s do aviso da câmera até a análise. ~2,5 s disso são as duas sondas
+de geometria (`ffprobe`), refeitas a cada conexão (invariante 2b).
+
+**Térmico.** Com as três capturas: 76–79 °C na tarde, sem throttling
+(`0x0`), a 1 °C do limite. Cada captura custou 15–19% de um núcleo (o
+substream daqui é 30 fps; na CTF, 10%). Com as três pausadas: **70,1 °C** — o
+gatilho também esfria a Pi. O substream tem quadro-chave a cada 2 s; com
+quadro-chave a cada 1 s na câmera, decodificar só as chaves (`-skip_frame
+nokey`) cortaria a captura ~30×, mas isso muda a configuração da câmera.
