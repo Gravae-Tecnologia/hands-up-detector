@@ -161,6 +161,8 @@ class Cam(BaseHTTPRequestHandler):
     batida_s = 0.5
     attaches = 0
     status_tipo = 200
+    senha_errada = False       # responde 401 com desafio Digest a tudo
+    logins_falhos = 0          # tentativas COM credencial recusadas
 
     def log_message(self, *a):
         pass
@@ -182,6 +184,15 @@ class Cam(BaseHTTPRequestHandler):
 
     def do_GET(self):
         c = type(self)
+        if c.senha_errada:
+            if self.headers.get("Authorization", "").startswith("Digest"):
+                c.logins_falhos += 1
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Digest realm="Login to teste", '
+                             'qop="auth", nonce="abc123", opaque="def456"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if "getDeviceType" in self.path:
             return self._texto(f"type={c.modelo}\r\n", c.status_tipo)
         if "getExposureEvents" in self.path:
@@ -257,6 +268,16 @@ def teste_sonda(porta):
     r = ia.sonda("127.0.0.1", "u", "p", porta=livre, timeout=2)
     ok(r["suporta"] is None and "nao respondeu" in r["motivo"],
        "camera fora do ar: nao sei (e vai sondar de novo em 5 min)")
+    Cam.senha_errada, Cam.logins_falhos = True, 0
+    a = time.time()
+    r = ia.sonda("127.0.0.1", "u", "errada", porta=porta)
+    ok(r["suporta"] is None and r.get("credencial") is False
+       and "credencial" in r["motivo"] and time.time() - a < 3,
+       f"senha diferente da do Shinobi: nao sei, com motivo, sem travar ({time.time()-a:.2f} s)")
+    ok(Cam.logins_falhos == 1,
+       f"UMA tentativa com credencial por pergunta (houve {Cam.logins_falhos}; "
+       "a stdlib faz 6 e a Intelbras bloquearia o usuario)")
+    Cam.senha_errada = False
 
 
 def teste_vigia(porta):
@@ -348,6 +369,16 @@ def teste_servico(porta):
         S.aplica_config()
         ok(c.vigia is None and c.modo == "manual" and c.ativa,
            "voltou para manual: fecha a conexao e fica sempre ativa")
+        # credencial recusada NAO resonda em 5 min (so no prazo longo)
+        velho = time.time() - ia.RESONDA_FALHA_S - 10
+        c.ia = {"suporta": None, "credencial": False, "sondado_em": velho}
+        c.resonda_se_preciso(time.time())
+        ok(not c.sondando, "credencial recusada: nao insiste em 5 min")
+        c.ia = {"suporta": None, "sondado_em": velho}
+        c.resonda_se_preciso(time.time())
+        ok(c.sondando or c.ia.get("suporta") is True,
+           "camera que so nao respondeu: sonda de novo em 5 min")
+        ok(espera(lambda: not c.sondando), "sonda terminou")
         ok(S.cfgmod.Config.valida_gatilho({"gatilho": "sempre"}) is not None
            and S.cfgmod.Config.valida_gatilho({"espera_ia_s": 10}) is not None
            and S.cfgmod.Config.valida_gatilho({"gatilho": "ia", "espera_ia_s": 600}) is None,
