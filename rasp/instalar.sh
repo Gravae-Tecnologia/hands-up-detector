@@ -50,16 +50,43 @@ NEED=""
 python3 -c "import cv2" 2>/dev/null || NEED="$NEED python3-opencv"
 command -v ffmpeg >/dev/null || NEED="$NEED ffmpeg"
 if [ -n "$NEED" ]; then
-  sudo apt-get update -qq && sudo apt-get install -y -q $NEED
+  # `update` com erro NAO quer dizer listas inuteis. O Debian 11 (bullseye)
+  # saiu do LTS em 31/08/2026 e o Release do bullseye-security expirou: o
+  # `apt-get update` sai com erro, mas o repositorio principal atualiza e o
+  # python3-opencv esta nele. O `update && install` de antes pulava o install
+  # em silencio - `set -e` nao pega falha no meio de um `&&` - e o servico
+  # subia e morria em loop sem cv2. Foi a primeira instalacao no Fit Club,
+  # 10/09/2026.
+  sudo apt-get update -qq || echo "    aviso: apt-get update com erro (repositorio expirado?); seguindo com as listas que ha"
+  if ! sudo apt-get install -y -q $NEED; then
+    # Mesma causa, segundo sintoma: as listas velhas do *-security ainda
+    # apontam para versoes que sairam do servidor (404 em libpq5 e
+    # libgdcm3.0, dependencias do opencv, no Fit Club). Mirando o repositorio
+    # principal da mesma versao, o apt escolhe o que ainda existe - simulado
+    # la antes: 62 pacotes novos, nenhum removido, nenhum rebaixado.
+    CODINOME=$(. /etc/os-release && echo "${VERSION_CODENAME:-}")
+    echo "    install falhou; tentando so o repositorio principal (-t $CODINOME)"
+    [ -n "$CODINOME" ] && sudo apt-get install -y -q -t "$CODINOME" $NEED
+  fi
 else
   echo "    ja instaladas"
 fi
+# confere de verdade: dependencia faltando tem de aparecer AQUI, com motivo,
+# e nao como um servico reiniciando a cada 10 s
+python3 -c "import cv2" 2>/dev/null || { echo "ERRO: python3-opencv nao ficou instalado" >&2; exit 1; }
+command -v ffmpeg >/dev/null || { echo "ERRO: ffmpeg nao ficou instalado" >&2; exit 1; }
 
 echo "==> codigo em $DESTINO"
 sudo mkdir -p "$DESTINO"
 # copia todos os modulos: esquecer um so aparece no boot do servico
 sudo cp "$DIR"/*.py "$DESTINO/"
 [ "$MODO" = local ] && sudo cp -r "$DIR/modelos" "$DESTINO/"
+# Qual commit esta rodando. Sem isto, conferir se uma atualizacao chegou a
+# uma Pi era comparar hash de arquivo na mao - e a ponte do agente ja
+# reinstalou codigo velho respondendo ok. O servico devolve em /api/config.
+( git -C "$DIR" rev-parse --short HEAD 2>/dev/null || echo desconhecida ) \
+  | sudo tee "$DESTINO/VERSAO" >/dev/null
+echo "    versao $(cat "$DESTINO/VERSAO")"
 sudo chown -R "$USUARIO:$USUARIO" "$DESTINO"
 
 echo "==> venv"
