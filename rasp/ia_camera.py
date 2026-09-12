@@ -1,4 +1,12 @@
-"""Presenca de gente pela IA da propria camera (Intelbras/Dahua).
+"""Presenca de gente pela IA da propria camera (Intelbras/Dahua e Hikvision).
+
+UM GATILHO, VARIOS FABRICANTES
+    Cada fabricante avisa pessoa do seu jeito - Intelbras/Dahua com
+    `SmartMotionHuman` (Start/Stop), Hikvision com VMD filtrado por alvo
+    humano (MD 2.0) ou eventos inteligentes da AcuSense (pulsos). A `sonda`
+    descobre o fabricante e o que esta ligado pela API da camera; a `Vigia`
+    ouve o stream certo; e tudo vira o mesmo evento na mesma `Presenca`. A
+    regra do gatilho (`decide`) nao sabe de fabricante nenhum.
 
 POR QUE
     O hands-up so tem o que fazer com gente em quadra, mas ate aqui cada
@@ -34,6 +42,7 @@ NA DUVIDA, CONSIDERA QUE TEM GENTE
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 import urllib.error
@@ -301,38 +310,119 @@ def _get(op, url, timeout):
 def sonda(host, usuario, senha, porta=80, timeout=6):
     """O que a camera oferece, perguntado a ela. Nunca levanta excecao.
 
-    `suporta`  True/False, ou None se nao deu para saber (camera fora do ar,
-               credencial recusada)
-    `ligada`   a deteccao de humano esta habilitada NA camera
-    `motivo`   frase para o painel quando nao da para usar
+    `suporta`    True/False: a camera sabe filtrar PESSOA; None se nao deu para
+                 saber (fora do ar, credencial recusada)
+    `ligada`     esse filtro esta habilitado NA camera
+    `fabricante` "intelbras/dahua" | "hikvision" | None
+    `eventos`    o que a vigia deve ouvir quando `ligada` (ex. SmartMotionHuman,
+                 VMD, fielddetection)
+    `motivo`     frase para o painel quando nao da para usar
 
-    Tres perguntas, ~1 s por camera no Fit Club: o modelo (e se a API
-    Intelbras/Dahua existe), a lista de eventos que ela sabe publicar, e a
-    configuracao do SmartMotionDetect.
+    Pergunta pela API, nunca pelo nome do modelo: o censo de 10/09 marcava IA
+    so nas Intelbras "-IA" (14 cameras), e a VIP-1230-D-FC-PLUS - 714 cameras
+    na frota, sem o sufixo - publica SmartMotionHuman (Costa Verde, 8 de 8).
     """
-    ia = {"suporta": None, "ligada": None, "modelo": None, "evento": CODIGO,
-          "motivo": None, "sondado_em": round(time.time(), 1)}
+    ia = {"suporta": None, "ligada": None, "modelo": None, "fabricante": None,
+          "evento": CODIGO, "eventos": [], "motivo": None,
+          "sondado_em": round(time.time(), 1)}
     if not host:
         ia.update(suporta=False, motivo="monitor sem host no Shinobi")
         return ia
-    base = f"http://{host}:{porta}/cgi-bin/"
     op = abridor(host, usuario, senha, porta)
 
-    st, corpo = _get(op, base + "magicBox.cgi?action=getDeviceType", timeout)
+    st, corpo = _get(op, f"http://{host}:{porta}/cgi-bin/magicBox.cgi"
+                         "?action=getDeviceType", timeout)
     if st == 0:
         ia["motivo"] = f"camera nao respondeu em http:{porta} ({corpo})"
         return ia
+    if st == 200:
+        return _sonda_dahua(op, host, porta, timeout, ia, corpo)
+    if st != 401:
+        # nao e Intelbras/Dahua (Hikvision responde 404 nessa rota): ISAPI?
+        st, corpo = _get(op, f"http://{host}:{porta}/ISAPI/System/deviceInfo", timeout)
+        if st == 200:
+            return _sonda_hikvision(op, host, porta, timeout, ia, corpo)
     if st == 401:
         # `credencial: False` faz a proxima sonda esperar o prazo longo (ver
         # `RESONDA_OK_S`): senha nao se conserta sozinha, e insistir a cada 5
         # min so acumularia login falho ate a camera bloquear o usuario.
         ia.update(motivo="camera recusou a credencial do Shinobi", credencial=False)
         return ia
-    if st != 200:
-        ia.update(suporta=False,
-                  motivo=f"sem API Intelbras/Dahua (HTTP {st}); outro fabricante?")
-        return ia
-    ia["modelo"] = _kv(corpo).get("type")
+    ia.update(suporta=False, motivo=f"fabricante nao suportado: sem API Intelbras/"
+                                    f"Dahua nem Hikvision ISAPI (HTTP {st})")
+    return ia
+
+
+def _tag(xml, nome):
+    """Valor da primeira <nome>...</nome>, ou None se a tag nao existe."""
+    m = re.search(rf"<{nome}>([^<]*)</{nome}>", xml)
+    return m.group(1) if m else None
+
+
+#: Eventos inteligentes da Hikvision (AcuSense) com alvo configuravel:
+#: (eventType no alertStream, recurso em /ISAPI/Smart/...).
+HIK_INTELIGENTES = (("fielddetection", "FieldDetection"),
+                    ("linedetection", "LineDetection"),
+                    ("regionEntrance", "RegionEntrance"),
+                    ("regionExiting", "RegionExiting"))
+
+
+def _hik_item_humano(xml):
+    """O evento inteligente esta ligado E tem algum item (regiao/linha) ligado
+    com alvo humano? O <enabled> do topo e o do evento; cada item tem o seu."""
+    if _tag(xml, "enabled") != "true":
+        return False
+    for _, corpo in re.findall(r"<(\w+(?:Region|Item))\b[^>]*>(.*?)</\1>", xml, re.S):
+        if (_tag(corpo, "enabled") == "true"
+                and "human" in (_tag(corpo, "detectionTarget") or "")):
+            return True
+    return False
+
+
+def _sonda_hikvision(op, host, porta, timeout, ia, info):
+    """Hikvision pela ISAPI. Duas fontes de pessoa, medidas na frota em 12/09:
+
+    - Movimento com alvo (MD 2.0, linhas Value e AcuSense): `motionDetection`
+      traz `targetType`; com `human` e habilitado, o VMD so dispara com pessoa.
+      Arena Litoral (DS-2CD1121G2-LIU): ligado, VMD ~1/s com gente. Arena
+      Sunset (DS-2CD1027G2H): tem o filtro, movimento desligado. Sem o campo
+      `targetType` (linha G0) e movimento comum - nao serve de gatilho.
+    - Eventos inteligentes (AcuSense): invasao de area, linha, entrada/saida
+      de regiao, cada item com `detectionTarget`. Tribo do Lobo
+      (DS-2CD2347G2-LU): suporta todos, todos desligados.
+    """
+    base = f"http://{host}:{porta}/ISAPI/"
+    ia.update(fabricante="hikvision", modelo=_tag(info, "model"))
+    pode, eventos = False, []
+    st, md = _get(op, base + "System/Video/inputs/channels/1/motionDetection", timeout)
+    if st == 200 and _tag(md, "targetType") is not None:
+        pode = True
+        if _tag(md, "enabled") == "true" and "human" in _tag(md, "targetType"):
+            eventos.append("VMD")
+    st, cap = _get(op, base + "Smart/capabilities", timeout)
+    if st == 200:
+        for evento, recurso in HIK_INTELIGENTES:
+            if f"<isSupport{recurso}>true<" not in cap:
+                continue
+            st, x = _get(op, base + f"Smart/{recurso}/1", timeout)
+            if st == 200 and "detectionTarget" in x:
+                pode = True
+                if _hik_item_humano(x):
+                    eventos.append(evento)
+    ia.update(suporta=pode, ligada=bool(eventos) if pode else None,
+              eventos=eventos, evento=eventos[0] if eventos else "VMD")
+    if not pode:
+        ia["motivo"] = "camera Hikvision sem filtro de pessoa (so movimento comum)"
+    elif not eventos:
+        ia["motivo"] = ("deteccao de pessoa desligada na camera (Hikvision: "
+                        "movimento com alvo humano ou evento inteligente)")
+    return ia
+
+
+def _sonda_dahua(op, host, porta, timeout, ia, tipo):
+    """Intelbras/Dahua pela CGI: modelo, eventos publicados e SmartMotionDetect."""
+    base = f"http://{host}:{porta}/cgi-bin/"
+    ia.update(fabricante="intelbras/dahua", modelo=_kv(tipo).get("type"))
 
     st, corpo = _get(op, base + "eventManager.cgi?action=getExposureEvents", timeout)
     eventos = ({v for k, v in _kv(corpo).items() if k.startswith("events")}
@@ -357,6 +447,8 @@ def sonda(host, usuario, senha, porta=80, timeout=6):
     elif not ia["ligada"]:
         ia["motivo"] = ("deteccao de humano desligada na camera "
                         "(SmartMotionDetect: Enable/ObjectTypes.Human)")
+    if ia["ligada"]:
+        ia["eventos"] = [CODIGO]
     return ia
 
 
@@ -380,19 +472,39 @@ def em_curso_agora(op, host, porta=80, timeout=6):
     return out
 
 
+def hik_alerta(bloco):
+    """<EventNotificationAlert> da Hikvision -> (eventType, eventState).
+
+    O VMD nao traz o tipo de alvo: o filtro de pessoa e aplicado DENTRO da
+    camera, pela config de movimento. Chega `active` de novo a cada ~1 s
+    enquanto ha movimento, sem `inactive` no fim - por isso vira pulso, nao
+    Start/Stop. XML real da Arena Litoral em teste_gatilho.py.
+    """
+    return _tag(bloco, "eventType"), _tag(bloco, "eventState")
+
+
 class Vigia:
     """Uma conexao de eventos aberta com a camera, alimentando uma Presenca.
 
-    Reconecta sozinha, com espera crescente ate 60 s. Parar e so sinalizar:
-    a batida chega a cada ~5 s e o laco confere o sinal a cada linha.
+    Um fabricante, um stream, a mesma Presenca: Intelbras/Dahua pelo
+    `eventManager.cgi?action=attach` (Start/Stop), Hikvision pelo
+    `/ISAPI/Event/notification/alertStream` (pulsos). Reconecta sozinha, com
+    espera crescente ate 60 s. Parar e so sinalizar: as batidas chegam a cada
+    ~5-8 s e o laco confere o sinal a cada linha.
     """
 
-    def __init__(self, nome, host, usuario, senha, presenca, porta=80):
+    def __init__(self, nome, host, usuario, senha, presenca, porta=80, ia=None):
         self.nome, self.host, self.porta = nome, host, porta
         self.presenca = presenca
         self.op = abridor(host, usuario, senha, porta)
-        self.url = (f"http://{host}:{porta}/cgi-bin/eventManager.cgi?action=attach"
-                    f"&codes=%5B{CODIGO}%5D&heartbeat=5")
+        ia = ia or {}
+        self.hik = ia.get("fabricante") == "hikvision"
+        self.eventos = set(ia.get("eventos") or (["VMD"] if self.hik else [CODIGO]))
+        if self.hik:
+            self.url = f"http://{host}:{porta}/ISAPI/Event/notification/alertStream"
+        else:
+            self.url = (f"http://{host}:{porta}/cgi-bin/eventManager.cgi?action=attach"
+                        f"&codes=%5B{CODIGO}%5D&heartbeat=5")
         self.erro = None
         self.conexoes = 0
         self._parar = threading.Event()
@@ -418,21 +530,13 @@ class Vigia:
         while not self._parar.is_set():
             try:
                 self._resp = self.op.open(self.url, timeout=LEITURA_S)
+                # pulso nao tem "em curso"; so a Intelbras responde a pergunta
                 self.presenca.conectou(
-                    time.time(), em_curso_agora(self.op, self.host, self.porta))
+                    time.time(), () if self.hik else
+                    em_curso_agora(self.op, self.host, self.porta))
                 self.conexoes += 1
                 self.erro, espera = None, 5
-                while not self._parar.is_set():
-                    ln = self._resp.readline()
-                    if not ln:
-                        raise ConnectionError("a camera fechou o stream de eventos")
-                    s = ln.decode("utf-8", "replace").strip()
-                    if s == "Heartbeat":
-                        self.presenca.batida(time.time())
-                        continue
-                    ev = interpreta(s)
-                    if ev and ev["codigo"] == CODIGO:
-                        self.presenca.evento(ev["acao"], ev["indice"], time.time())
+                (self._le_hikvision if self.hik else self._le_dahua)()
             except urllib.error.HTTPError as e:
                 self.erro = ("camera recusou a credencial" if e.code == 401
                              else f"HTTP {e.code} no attach")
@@ -454,3 +558,36 @@ class Vigia:
                 self.presenca.caiu(time.time())
             self._parar.wait(espera)
             espera = espera if espera >= RECUO_CREDENCIAL_S else min(espera * 2, 60)
+
+    def _linhas(self):
+        while not self._parar.is_set():
+            ln = self._resp.readline()
+            if not ln:
+                raise ConnectionError("a camera fechou o stream de eventos")
+            yield ln.decode("utf-8", "replace")
+
+    def _le_dahua(self):
+        for ln in self._linhas():
+            s = ln.strip()
+            if s == "Heartbeat":
+                self.presenca.batida(time.time())
+                continue
+            ev = interpreta(s)
+            if ev and ev["codigo"] in self.eventos:
+                self.presenca.evento(ev["acao"], ev["indice"], time.time())
+
+    def _le_hikvision(self):
+        bloco = []
+        for ln in self._linhas():
+            bloco.append(ln)
+            if "</EventNotificationAlert>" not in ln:
+                if len(bloco) > 400:        # alerta nunca fechou: descarta
+                    bloco = []
+                continue
+            tipo, estado = hik_alerta("".join(bloco))
+            bloco = []
+            if tipo in self.eventos and estado == "active":
+                self.presenca.evento("Pulse", 0, time.time())
+            else:
+                # o `videoloss inactive` periodico e a batida da Hikvision
+                self.presenca.batida(time.time())
