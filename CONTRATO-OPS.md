@@ -10,7 +10,10 @@ lê e escreve para oferecer as duas ativações:
   `espera_ia_s` depois da última pessoa vista (padrão 10 min).
 
 A Pi descobre sozinha quais câmeras têm IA. O painel só mostra o resultado e
-deixa o operador escolher.
+deixa o operador escolher. Vale para **Intelbras/Dahua** (`SmartMotionHuman`) e
+**Hikvision** (movimento com alvo humano, a MD 2.0, e eventos inteligentes da
+AcuSense). O selo e o `modo` são os mesmos para os dois; só `ia.fabricante` e
+`ia.eventos` dizem de onde vem.
 
 ## Caminho
 
@@ -54,6 +57,8 @@ terminar.
 |---|---|---|
 | `mid`, `ligada`, `processando` | `quadra01_camera01`, `true`, `true` | como antes |
 | `ia_usavel` | `true` | selo **IA** na câmera |
+| `ia.fabricante` | `"intelbras/dahua"`, `"hikvision"` ou `null` | de quem é a API que respondeu |
+| `ia.eventos` | `["SmartMotionHuman"]`, `["VMD"]`, `["fielddetection"]` | o que a Pi ouve quando a IA está ligada; vazio se não está |
 | `ia.modelo` | `"VIP-3430-D-IA"` | texto do selo |
 | `ia.motivo` | `null`, ou `"deteccao de humano desligada na camera (...)"` | por que **não** dá para usar a IA |
 | `modo` | `"gente"` | estado atual, ver a tabela abaixo |

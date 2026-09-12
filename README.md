@@ -82,9 +82,16 @@ para desenhar os switches.
 
 ### Só com gente em quadra (gatilho pela IA da câmera)
 
-Câmera ligada captura o dia inteiro, com a quadra vazia ou não. As Intelbras da
-linha **-IA** (ex. VIP-3430-D-IA) detectam humano sozinhas; com o gatilho `ia`,
-a Pi só captura — e só paga a nuvem — enquanto há gente:
+Câmera ligada captura o dia inteiro, com a quadra vazia ou não. Muitas câmeras
+da frota detectam pessoa sozinhas; com o gatilho `ia`, a Pi só captura — e só
+paga a nuvem — enquanto há gente:
+
+| fabricante | o que a Pi ouve | conferido em |
+|---|---|---|
+| Intelbras/Dahua | `SmartMotionHuman` (Start/Stop) pelo `eventManager.cgi?action=attach` | VIP-3430-D-IA (Fit Club), VIP-1230-D-FC-PLUS (Costa Verde) |
+| Hikvision MD 2.0 | `VMD` com `targetType` humano (pulsos) pelo `/ISAPI/Event/notification/alertStream` | DS-2CD1121G2-LIU (Arena Litoral, com jogo em campo) |
+| Hikvision AcuSense | invasão de área, linha, entrada/saída de região com alvo humano | DS-2CD2347G2-LU (Tribo do Lobo: suporta, desligado) |
+
 
 ```bash
 curl -XPOST localhost:8090/api/config -d '{"gatilho":"ia"}'        # ou "manual" (padrão)
@@ -621,4 +628,5 @@ python teste_cronologia.py     # ordem, falha, resposta pendurada, controlador
 python teste_integracao.py     # gesto contínuo com latência alternada 0,4/3,4 s
 python teste_aspecto.py        # geometria da captura (câmera 9:16, substream)
 python teste_gatilho.py        # gatilho pela IA, contra uma câmera falsa em localhost
+python teste_fabricantes.py    # Hikvision (ISAPI) falsa + leitura do banco do Shinobi
 ```

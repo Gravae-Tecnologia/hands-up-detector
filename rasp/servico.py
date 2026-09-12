@@ -73,6 +73,21 @@ def versao():
         return "desconhecida"
 
 
+_ESCAPES_MYSQL = {"n": "\n", "t": "\t", "0": "\0", "\\": "\\"}
+
+
+def desescapa_mysql(s):
+    """Desfaz o escape do `mysql -B`: `\\\\` -> `\\`, `\\n` -> quebra, `\\t` -> tab.
+
+    Antes so o `\\n` era tirado. Monitor cujo `details` tem barra invertida (JSON
+    dentro de string: `\\"`, `\\/`) saia com as barras DOBRADAS, o json.loads
+    falhava, `muser`/`mpass` sumiam - e a camera respondia 401 ao RTSP e a API.
+    Na Epic Boulevard (12/09) eram as 9 cameras, com 196 barras no `details`
+    de cada uma: parecia "senha diferente", era a leitura do banco.
+    """
+    return re.sub(r"\\(.)", lambda m: _ESCAPES_MYSQL.get(m.group(1), m.group(1)), s)
+
+
 def cameras():
     """Monitores do Shinobi, com o RTSP completo.
 
@@ -92,7 +107,9 @@ def cameras():
             continue
         mid, nome, host, porta, caminho, larg, alt, modo = campos[:8]
         try:
-            det = json.loads(campos[8].replace("\\n", ""))
+            # strict=False: quebra de linha crua dentro de string (o que o
+            # `.replace` antigo apagava) nao pode derrubar a credencial
+            det = json.loads(desescapa_mysql(campos[8]), strict=False)
         except Exception:
             det = {}
         usr, pwd = det.get("muser") or "", det.get("mpass") or ""
@@ -347,10 +364,12 @@ class Camera:
         if self.vigia is not None:
             return
         self.presenca = iamod.Presenca(espera_s)
+        # o `ia` diz o fabricante e os eventos ligados: e dele que a vigia
+        # escolhe o stream (Intelbras attach x Hikvision alertStream)
         self.vigia = iamod.Vigia(self.mid, self.cam.get("host"),
                                  self.cam.get("usuario", ""),
                                  self.cam.get("senha", ""),
-                                 self.presenca).inicia()
+                                 self.presenca, ia=self.ia).inicia()
 
     def nao_ouve(self):
         if self.vigia is None:
