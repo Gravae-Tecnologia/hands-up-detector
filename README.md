@@ -630,3 +630,12 @@ python teste_aspecto.py        # geometria da captura (câmera 9:16, substream)
 python teste_gatilho.py        # gatilho pela IA, contra uma câmera falsa em localhost
 python teste_fabricantes.py    # Hikvision (ISAPI) falsa + leitura do banco do Shinobi
 ```
+
+
+### Estado separado das credenciais do agent
+
+O instalador usa `/var/lib/gravae-hands-up/config.json`, pertencente ao usuário do detector (diretório 0700, arquivo 0600). A unidade systemd define `HANDS_UP_CONFIG`; não é necessário conceder escrita em `/etc/gravae`, onde ficam as credenciais individuais do DIRECT.
+
+Na primeira atualização, uma configuração antiga de `/etc/gravae/hands-up.json` é copiada preservando switches e parâmetros. O arquivo antigo permanece intacto para rollback. Instalações seguintes usam o estado novo, evitando recuperar switches antigos. Instalação nova começa desligada. O instalador não modifica permissões existentes de `/etc/gravae`; eventual correção de permissões legadas exige auditoria dos outros serviços da unidade.
+
+Validação do estado: `python3 -m unittest discover -s rasp -p test_install_state.py`.
