@@ -21,18 +21,20 @@ AcuSense). O selo e o `modo` são os mesmos para os dois; só `ia.fabricante` e
 OPS ──HTTPS──> agent da arena (:8888, pelo túnel) ──localhost──> detector (:8090)
      GET  /hands-up/status   → devolve o /api/config do detector inteiro em `config`
      POST /hands-up/apply    → {"config": {...}}  (um POST por chave no detector)
-     POST /hands-up/install  → clona/atualiza e roda o instalador
+     POST /hands-up/install  → {"revision": <SHA de 40>, ...}: busca essa revisão e roda o instalador
 ```
+
+Desde o OPS #428/#429 o OPS fala com o agent pelo serviço de suporte privado
+(por `deviceId`, transporte LEGACY ou VPN), e não direto pelo túnel.
 
 | peça | versão mínima | por quê |
 |---|---|---|
-| detector | `11a800d` (hands-up-detector#9 a #12) | gatilho, sonda de IA, `versao`, ffprobe do Debian 11, filtro de falso positivo |
-| agent | **3.7.9** (patch pendente, ver o fim) | repassar `gatilho`/`espera_ia_s`/`sondar_ia` no `apply` |
+| detector | `d035a78` (hands-up-detector#21) | gatilho, sonda multi-fabricante, `versao`, estado em `/var/lib/gravae-hands-up` (#19/#20) e o painel local que diz por que cada câmera analisa (#21) |
+| agent | **4.0.5** (patch pendente, ver o fim) | a 4.0.4 instala por revisão fixa, mas não repassa `gatilho`/`espera_ia_s`/`sondar_ia` no `apply` |
 
-A **leitura** já funciona com o agent atual (3.7.x): o status repassa o
-`/api/config` inteiro. Só a **escrita** do gatilho precisa do 3.7.9. Agent
-3.6.x (o Fit Club está no 3.6.9) não tem a ponte do hands-up:
-`/hands-up/status` responde 404. Atualize pelo `/update/perform`.
+A **leitura** já funciona com o agent 4.0.4 (e com a ponte da 3.7.x): o status
+repassa o `/api/config` inteiro. Só a **escrita** do gatilho precisa da 4.0.5.
+Agent 3.6.x não tem a ponte do hands-up: `/hands-up/status` responde 404.
 
 ## Leitura: `GET /hands-up/status` → `config`
 
@@ -107,14 +109,20 @@ terminar.
 
 ## Instalação (`POST /hands-up/install`)
 
-Responde na hora: `{"ok": true, "iniciado": true, "instalacao": {"estado": "rodando", ...}}`.
+Agent 4.0.4+: o corpo leva `revision` (SHA completo de 40 caracteres), `nuvem`
+e `webhook`. O agent busca só essa revisão (`fetch --depth 1` + `checkout
+--detach`), confere que o HEAD é o pedido e **recusa clone com alteração
+local** (`etapa: "revision"`, `erro: "checkout possui alteracoes locais"`). A
+Pi passa a responder `versao` = os 7 primeiros caracteres da revisão.
+
+Responde na hora: `{"ok": true, "iniciado": true, "instalacao": {"estado": "rodando", "revision": ..., ...}}`.
 Se já houver uma instalação em curso, vem `{"ok": false, "ja_rodando": true, ...}`. Acompanhe
 por `status().instalacao`:
 
 | campo | valores |
 |---|---|
 | `estado` | `ocioso` → `rodando` → `concluido` \| `falhou` |
-| `etapa` | agent ≤ 3.7.8: fica `clone` durante toda a instalação e vira `instalar.sh` só no fim. Com o patch 3.7.9: `clone` (do zero) ou `atualiza` (já tinha) → `instalar.sh` durante a execução |
+| `etapa` | `clone`, `revision` (falha ao buscar/conferir a revisão ou clone sujo), `instalar.sh` |
 | `ok`, `erro`, `saida` | preenchidos no fim; `saida` traz o fim do log do instalador |
 
 **Já instalado:** o mesmo botão atualiza o código e roda o instalador de novo, que preserva a
@@ -134,7 +142,7 @@ Logo depois de instalar, `quadras` e `cameras` **não** vêm `{}`: o serviço cr
 ## Tela sugerida
 
 ```
-Hands-up · Arena exemplo (parque misto)                 versão 11a800d
+Hands-up · Arena exemplo (parque misto)                 versão d035a78
 Ativação  ( ) Manual: sempre ativa
           (•) Automática: só com gente em quadra        3 de 3 câmeras com IA
               pausa depois de [10] min sem ninguém       [Testar câmeras]
@@ -167,11 +175,11 @@ Economia hoje: 64% do tempo pausado
 
 ## Pendente para o painel funcionar ponta a ponta
 
-1. **Agent 3.7.9.** O patch está pronto (`hands_up_module.py`: repassa as três
-   chaves, devolve o motivo quando o detector recusa e corrige a atualização
-   que reinstalava código velho em silêncio). Sem push no
+1. **Agent 4.0.5.** O porte em cima da 4.0.4 está pronto
+   (`hands_up_module.py`: repassa as três chaves antes do `ativo`, confere o
+   eco e devolve o motivo quando o detector recusa com 400). Sem push no
    `gravae-arena-agent-python`, ele segue como patch para quem mantém o repo.
-   Aplica limpo na `main` do agent. Em cima do #36, só a linha `VERSION`
-   conflita (lá vira 3.8.0), por isso o painel deve confirmar pela leitura de
-   volta (`estado.config.gatilho`), e não pelo número da versão.
-2. **Fit Club:** agent 3.6.9 → atualizar pelo OPS para aparecer no painel.
+   O painel deve confirmar o gatilho pela leitura de volta
+   (`estado.config.gatilho`), e não pelo número da versão.
+2. **Agents antigos nas arenas:** Fit Club 3.6.9, CTF Marcelinho 3.7.6 e
+   Costa Verde 3.7.8 precisam da 4.0.4+ antes de instalar por revisão.
