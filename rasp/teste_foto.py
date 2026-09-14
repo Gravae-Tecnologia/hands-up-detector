@@ -1,5 +1,5 @@
-"""Foto de camera parada: renovada so enquanto o painel olha, uma de cada vez,
-e com a hora no canto.
+"""Camera parada no painel: previa ao vivo so enquanto alguem olha, nunca
+junto com a captura, e com a hora no canto.
 
     python3 teste_foto.py
 """
@@ -21,52 +21,83 @@ def ok(cond, msg):
         falhas.append(msg)
 
 
+def espera(cond, s=5):
+    t0 = time.time()
+    while time.time() - t0 < s:
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
 def camera():
     c = S.Camera.__new__(S.Camera)
     c.mid, c.ativa, c.saida, c.erro = "quadra01_camera01", False, None, None
-    c.t_foto, c.tirando = 0.0, False
+    c.t_olhar, c.previa, c.p_previa = 0.0, None, None
     c.larg, c.alt, c.fonte = 64, 48, "rtsp://x"
     c._geometria = lambda: True
     return c
 
 
-def teste_ritmo():
-    print("1. renova_foto: so parada, uma de cada vez, a cada FOTO_PARADA_S")
-    fotos, libera = [], threading.Event()
+class FfmpegFalso:
+    """Um quadro preto a cada 50 ms; `kill` corta o pipe como o de verdade."""
+    abertos = 0
 
-    def foto_falsa(self, *a, **k):
-        fotos.append(time.time())
-        libera.wait(5)
-        self.tirando = False
+    def __init__(self, *a, **k):
+        FfmpegFalso.abertos += 1
+        self.morto = threading.Event()
+        self.quadros = 0
+        me = self
 
-    orig = S.Camera.foto
-    S.Camera.foto = foto_falsa
+        class Saida:
+            def read(self, n):
+                if me.morto.wait(0.05):
+                    return b""
+                me.quadros += 1
+                return bytes(n)
+        self.stdout = Saida()
+
+    def kill(self):
+        self.morto.set()
+
+
+def teste_previa():
+    print("1. previa: so parada, so com o painel aberto, uma por camera")
+    orig_popen, orig_ociosa = S.subprocess.Popen, S.PREVIA_OCIOSA_S
+    S.subprocess.Popen = FfmpegFalso
+    S.PREVIA_OCIOSA_S = 0.5
     try:
         c = camera()
-        ok(c.renova_foto() is True and c.tirando, "parada e sem foto recente: tira")
-        ok(c.renova_foto() is False, "com um ffmpeg de foto rodando: nao abre outro")
-        libera.set()
-        t0 = time.time()
-        while c.tirando and time.time() - t0 < 5:
-            time.sleep(0.01)
-        ok(c.renova_foto() is False, "foto recente (< FOTO_PARADA_S): nao tira")
-        c.t_foto -= S.FOTO_PARADA_S + 1
-        ok(c.renova_foto() is True, "passou FOTO_PARADA_S: tira de novo")
-        t0 = time.time()
-        while c.tirando and time.time() - t0 < 5:
-            time.sleep(0.01)
-        c.t_foto, c.ativa, c.saida = 0.0, True, b"jpeg anotado"
-        ok(c.renova_foto() is False, "capturando: nao tira (o quadro anotado ja vem a 1 fps)")
-        c.saida = None
-        ok(c.renova_foto() is True, "capturando mas sem nenhuma imagem ainda: tira")
-        ok(len(fotos) == 3, f"ffmpeg de foto chamados: {len(fotos)}")
+        ok(c.olhado() is True, "parada e o painel pediu: abre a previa")
+        ok(espera(lambda: c.saida is not None), "previa escreveu quadro")
+        primeiro = c.saida
+        ok(c.olhado() is False and FfmpegFalso.abertos == 1,
+           "painel pedindo de novo: nao abre outra")
+        ok(espera(lambda: c.saida is not primeiro), "quadro renova sozinho")
+        img = cv2.imdecode(np.frombuffer(c.saida, np.uint8), cv2.IMREAD_COLOR)
+        ok(img[-25:, :].max() > 200 and img[:16, :].max() < 40,
+           "quadro leva a hora no rodape e o resto fica intacto")
+        ok(espera(lambda: not c.previa.is_alive(), 3),
+           "painel fechado (sem pedido por PREVIA_OCIOSA_S): previa para")
+        ok(c.p_previa is None, "e mata o ffmpeg dela")
+
+        c.olhado()
+        ok(espera(lambda: c.p_previa is not None), "painel reaberto: previa volta")
+        p = c.p_previa
+        c.ativa = True                       # o que `liga` faz primeiro
+        c.p_previa.kill()                    # e depois isto
+        ok(espera(lambda: not c.previa.is_alive(), 2),
+           "camera ligou: previa sai, a captura assume")
+        ok(p.morto.is_set(), "ffmpeg da previa derrubado")
+        c.saida = b"anotado"
+        ok(c.olhado() is False and c.saida == b"anotado",
+           "capturando: painel pedindo nao abre previa nem pisa no quadro anotado")
     finally:
-        libera.set()
-        S.Camera.foto = orig
+        S.subprocess.Popen, S.PREVIA_OCIOSA_S = orig_popen, orig_ociosa
 
 
-def teste_carimbo():
-    print("2. foto leva a hora no canto e solta o `tirando`")
+def teste_foto():
+    print("2. foto de arranque leva a hora no canto")
     c = camera()
     w, h = c.larg, c.alt
     orig = S.subprocess.run
@@ -78,15 +109,12 @@ def teste_carimbo():
         S.subprocess.run = orig
     ok(c.saida is not None, "gravou a foto")
     img = cv2.imdecode(np.frombuffer(c.saida, np.uint8), cv2.IMREAD_COLOR)
-    ok(img is not None and img[h - 25:, :].max() > 200,
-       "quadro preto ganhou texto claro no rodape (a hora)")
-    ok(img is not None and img[:h // 3, :].max() < 40, "resto da imagem intacto")
-    ok(c.tirando is False, "tirando volta a False no fim")
+    ok(img is not None and img[-25:, :].max() > 200, "rodape com a hora")
 
 
 if __name__ == "__main__":
-    teste_ritmo()
-    teste_carimbo()
+    teste_previa()
+    teste_foto()
     print()
     print("FALHAS:" if falhas else "tudo ok", *falhas, sep="\n  ")
     raise SystemExit(1 if falhas else 0)
