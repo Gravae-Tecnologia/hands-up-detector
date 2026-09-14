@@ -53,6 +53,7 @@ import cv2
 import numpy as np
 
 import config as cfgmod
+from runtime_config import load_runtime, read_monitors
 import cronologia as cronmod
 import ia_camera as iamod
 import motor
@@ -98,10 +99,9 @@ def cameras():
     """
     sql = ("SELECT mid, name, host, port, path, width, height, mode, details "
            "FROM Monitors ORDER BY mid")
-    p = subprocess.run(["mysql", "-umajesticflame", "ccio", "-N", "-B", "-e", sql],
-                       capture_output=True, timeout=20)
+    rows = read_monitors(sql)
     saida = []
-    for linha in p.stdout.decode("utf-8", "replace").strip().split("\n"):
+    for linha in rows.decode("utf-8", "replace").strip().split("\n"):
         campos = linha.split("\t")
         if len(campos) < 9:
             continue
@@ -1719,11 +1719,7 @@ def main():
           f"captura: {'substream' if usa_sub else 'principal'}, proporcao da "
           f"camera, lado <= {args.lado_max}", flush=True)
 
-    dev = {}
-    try:
-        dev = json.load(open("/etc/gravae/device.json"))
-    except Exception:
-        pass
+    dev = load_runtime()['device']
     # `update` e nao atribuicao: `dur_gesto` ja foi posto em H.cfg acima e as
     # cameras leem dele ao serem criadas
     H.cfg.update({"threads": args.threads, "fps": args.fps,
