@@ -147,6 +147,14 @@ def throttled():
 #: substream seja grande, para o JPEG enviado a nuvem nao crescer sem limite.
 LADO_MAX = 720
 
+#: De quanto em quanto tempo a foto de uma camera PARADA (desligada ou pausada
+#: pelo gatilho) e renovada, enquanto alguem olha o painel. Antes a foto era
+#: tirada so ao parar a captura: com a CTF pausada pela IA da camera, o painel
+#: mostrava a quadra de horas antes e parecia travado (14/09/2026). A renovacao
+#: sai do `/foto/`, que o painel pede a cada segundo - com o painel fechado,
+#: custo zero.
+FOTO_PARADA_S = 20
+
 
 def url_substream(url):
     """URL do substream da MESMA camera, ou None se o padrao nao for conhecido.
@@ -276,8 +284,9 @@ class Camera:
     pixels do substream, ver `_geometria`, e isso e refeito a cada conexao:
     se virarem a camera de novo, a proxima reconexao ja pega.
 
-    Para a grade continuar util sem custo, cada camera guarda uma FOTO tirada
-    uma vez so no arranque.
+    Para a grade continuar util sem custo, cada camera parada guarda uma FOTO,
+    tirada no arranque e renovada so enquanto o painel esta aberto
+    (`renova_foto`).
     """
 
     def __init__(self, cam, lado_max=LADO_MAX, fps=1.0, substream=True):
@@ -294,6 +303,8 @@ class Camera:
         self.t_quadro = 0.0         # instante em que ele foi capturado
         self.novo = False           # ha quadro ainda nao processado?
         self.saida = None           # ultimo JPEG (foto, ou anotado se ligada)
+        self.t_foto = 0.0           # ultima tentativa de foto (ver renova_foto)
+        self.tirando = False        # ha um ffmpeg de foto rodando?
         self.ativa = False          # captura + entra no pool de inferencia?
         self.erro = None
         self.confs = []
@@ -317,6 +328,7 @@ class Camera:
         self.modo = "desligada"     # um de iamod.MODOS
         self.local = None           # clique no painel local forca liga/desliga
         self.tempo = {"ativa": 0.0, "pausada": 0.0}   # so conta no gatilho "ia"
+        self.t_foto = time.time()
         threading.Thread(target=self.foto, daemon=True).start()
         # Sonda JA no arranque, com tudo desligado: e o que deixa o OPS mostrar
         # quais cameras tem IA antes de o operador escolher o gatilho.
@@ -454,7 +466,32 @@ class Camera:
 
         Sai do substream, como a captura: alem de barato, e outra sessao que
         nao o principal que o Shinobi ja segura.
+
+        Leva a hora no canto: foto de camera parada so e renovada de tempos
+        em tempos (`renova_foto`), e sem a hora nao da para saber se o painel
+        esta mostrando a quadra de agora.
         """
+        self.tirando = True
+        try:
+            self._foto(tentativas)
+        finally:
+            self.tirando = False
+
+    def renova_foto(self):
+        """Tira foto nova se a camera esta parada e a atual ja passou de
+        `FOTO_PARADA_S`. Uma de cada vez: o painel pede a cada segundo e um
+        ffmpeg de foto leva ~2,5 s. Camera capturando nao precisa - o quadro
+        anotado ja chega a 1 fps."""
+        agora = time.time()
+        if (self.ativa and self.saida is not None) or self.tirando \
+                or agora - self.t_foto < FOTO_PARADA_S:
+            return False
+        self.t_foto = agora
+        self.tirando = True
+        threading.Thread(target=self.foto, daemon=True).start()
+        return True
+
+    def _foto(self, tentativas):
         for _t in range(tentativas):
           try:
             if not self._geometria():
@@ -469,7 +506,12 @@ class Camera:
                  "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
                 capture_output=True, timeout=40)
             if len(p.stdout) >= n:
-                img = np.frombuffer(p.stdout[:n], np.uint8).reshape(h, w, 3)
+                img = np.frombuffer(p.stdout[:n], np.uint8).reshape(h, w, 3).copy()
+                carimbo = "foto " + time.strftime("%H:%M:%S")
+                for cor, esp in (((0, 0, 0), 3), ((255, 255, 255), 1)):
+                    cv2.putText(img, carimbo, (8, h - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, cor, esp,
+                                cv2.LINE_AA)
                 ok, enc = cv2.imencode(".jpg", img,
                                        [int(cv2.IMWRITE_JPEG_QUALITY), 70])
                 if ok and (not self.ativa or self.saida is None):
@@ -1457,10 +1499,11 @@ class H(BaseHTTPRequestHandler):
             c = H.cams.get(mid)
             if not c:
                 return self._json({"erro": "camera desconhecida"})
+            # parada: foto nova a cada FOTO_PARADA_S, e so enquanto alguem olha
+            c.renova_foto()
             j = c.saida
             if j is None:
                 j = _marcador(c.mid, *c.dims())
-                threading.Thread(target=c.foto, daemon=True).start()
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
             self.send_header("Content-Length", str(len(j)))
