@@ -100,30 +100,9 @@ else
 fi
 
 echo "==> configuracao"
-sudo mkdir -p /etc/gravae
-if [ ! -f /etc/gravae/hands-up.json ]; then
-  # tudo DESLIGADO: uma atualizacao de parque nao pode comecar a consumir
-  # CPU e banda sozinha. O operador liga pelo OPS.
-  printf '{\n  "ativo": false,\n  "nuvem": "%s",\n  "webhook": "%s",\n  "fps": 1.0,\n  "quadras": {},\n  "cameras": {}\n}\n' \
-    "$NUVEM" "$WEBHOOK" | sudo tee /etc/gravae/hands-up.json >/dev/null
-  echo "    criada (tudo desligado)"
-else
-  echo "    ja existe, preservada"
-  [ -n "$NUVEM" ] && sudo python3 - "$NUVEM" "$WEBHOOK" <<'PY'
-import json, sys
-p = "/etc/gravae/hands-up.json"
-d = json.load(open(p))
-if sys.argv[1]: d["nuvem"] = sys.argv[1]
-if len(sys.argv) > 2 and sys.argv[2]: d["webhook"] = sys.argv[2]
-json.dump(d, open(p, "w"), indent=2)
-print("    nuvem/webhook atualizados")
-PY
-fi
-sudo chown "$USUARIO:$USUARIO" /etc/gravae/hands-up.json
-# o servico roda como $USUARIO e a config e salva por troca atomica, o que
-# exige criar um .tmp no diretorio. Dono continua root (o agente escreve o
-# device.json por la); so o grupo ganha escrita.
-sudo chgrp "$USUARIO" /etc/gravae && sudo chmod g+w /etc/gravae
+# Only the detector state directory is writable by its service user.
+# Preserve existing LEGACY switches by migrating once, without modifying the source.
+sudo python3 "$DIR/install_state.py" "$USUARIO" "$NUVEM" "$WEBHOOK"
 sudo touch /var/log/gravae-hands-up.log
 sudo chown "$USUARIO:$USUARIO" /var/log/gravae-hands-up.log
 

@@ -10,6 +10,7 @@ Wants=network-online.target
 Type=simple
 User=gravae
 WorkingDirectory=/opt/gravae-hands-up
+Environment=HANDS_UP_CONFIG=/var/lib/gravae-hands-up/config.json
 ExecStart=/opt/gravae-hands-up/venv/bin/python /opt/gravae-hands-up/servico.py --porta 8090
 Restart=always
 RestartSec=10
