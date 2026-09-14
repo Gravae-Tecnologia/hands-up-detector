@@ -1015,9 +1015,10 @@ h1{font-size:18px;margin:0 0 4px;font-weight:600}
 .cam:hover{border-color:#4a4f5e}
 .cam.on{border-color:#7c5cff;box-shadow:0 0 0 3px rgba(124,92,255,.14)}
 .cam img{width:100%;display:block;max-height:70vh;object-fit:contain;background:#000}
-.cam .lb{padding:8px 10px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
+.cam .lb{padding:8px 10px 2px;display:flex;justify-content:space-between;align-items:center;font-size:13px}
+.cam .pq{padding:0 10px 9px;color:#8b93a7;font-size:11px;line-height:1.35;min-height:15px}
 .tag{font-size:11px;font-weight:700;letter-spacing:.4px}
-.tag.on{color:#7c5cff}.tag.off{color:#5a6072}
+.tag.on{color:#7c5cff}.tag.off{color:#5a6072}.tag.esperando{color:#fbbf24}
 h2{font-size:14px;margin:22px 0 8px;color:#8b93a7;font-weight:600}
 table{border-collapse:collapse;width:100%;font-size:13px}
 th{text-align:left;color:#8b93a7;font-weight:500;padding:6px 10px;border-bottom:1px solid #232833}
@@ -1031,8 +1032,8 @@ tr.alerta td:first-child::before{content:"\2691 ";color:#ff4d6d}
 tr.alerta{animation:pisca 1s infinite}
 </style>
 <h1>Esqueletos ao vivo &mdash; 1 quadro por segundo</h1>
-<div class=sub>Clique numa camera para <b>ligar</b> a analise. So ela captura e processa &mdash;
-as outras param o ffmpeg por completo, para nao gastar CPU a toa.<br>
+<div class=sub id=gat>&nbsp;</div>
+<div class=sub>Clique numa camera para <b>ligar</b> a analise (depuracao: passa por cima do gatilho).<br>
 <a href="/pessoas" style="color:#7c5cff">quem levantou as maos</a> &middot;
 <a href="/revisao" style="color:#7c5cff">validar deteccoes</a></div>
 <div class=grade id=grade></div>
@@ -1049,6 +1050,7 @@ async function listar(){
     <div class=cam id="c_${c.mid}" onclick="alterna('${c.mid}')">
       <img id="i_${c.mid}" src="/foto/${c.mid}.jpg">
       <div class=lb><b>${c.nome}</b><span class="tag off" id="t_${c.mid}">DESLIGADA</span></div>
+      <div class=pq id="pq_${c.mid}"></div>
     </div>`).join('');
 }
 async function alterna(mid){
@@ -1063,15 +1065,26 @@ async function alterna(mid){
   });
 }
 function cor(v,a,b){return v<a?'ok':v<b?'warn':'bad'}
-// gatilho de cada camera: modo + ha quanto tempo a ultima pessoa foi vista
-function rotulo(g){
-  if(!g) return '';
-  const p=g.presenca;
-  let t=g.modo+(g.ia_usavel?' &middot; IA':'');
-  if(p&&p.ha_s!=null) t+=' &middot; pessoa ha '+dur(p.ha_s);
-  if(g.modo==='gente'&&p&&!p.em_curso) t+=' &middot; pausa em '+dur(p.restante_s);
-  if(g.modo==='gente'&&p&&p.em_curso) t+=' &middot; em movimento';
-  return t;
+// POR QUE esta camera esta (ou nao) analisando agora. No gatilho "ia" a
+// analise so roda quando a camera avisa gente, entao um "ANALISANDO" seco
+// faz parecer que roda o tempo todo - o rotulo tem de dizer o que a segurou.
+// Devolve [etiqueta, motivo, classe].
+function porque(c){
+  const g=c.gatilho||{}, p=g.presenca, ia=g.ia||{}, m=g.modo;
+  const selo=g.ia_usavel?('IA &middot; '+(ia.modelo||'')):'sem IA';
+  if(m==='desligada') return ['DESLIGADA','desligada no OPS','off'];
+  if(m==='manual')    return ['ANALISANDO','ativacao manual: analisa o tempo todo','on'];
+  if(m==='sem_ia')    return ['ANALISANDO','sempre ativa &mdash; '+(ia.motivo||'camera sem IA de pessoa'),'on'];
+  if(m==='sem_sinal') return ['ANALISANDO','sem contato com a IA da camera: na duvida, fica ligada','esperando'];
+  if(m==='forcada')   return ['FORCADA','clique neste painel, por cima do gatilho','on'];
+  if(m==='pausada')   return ['PAUSADA',(p&&p.ha_s!=null?'ninguem ha '+dur(p.ha_s):'nenhum aviso da camera')
+                              +' &middot; '+selo+' &middot; esperando aviso','off'];
+  if(m==='gente'){
+    if(p&&p.em_curso)   return ['ANALISANDO','a camera esta vendo gente AGORA &middot; '+selo,'on'];
+    if(p&&p.ha_s!=null) return ['ANALISANDO','aviso da camera ha '+dur(p.ha_s)+' &middot; pausa em '+dur(p.restante_s),'on'];
+    return ['ANALISANDO','prazo inicial (nenhum aviso ainda) &middot; pausa em '+dur(p?p.restante_s:0),'esperando'];
+  }
+  return [c.ativa?'ANALISANDO':'DESLIGADA','','off'];
 }
 function dur(s){
   if(s<60) return s.toFixed(0)+' s';
@@ -1081,11 +1094,17 @@ function dur(s){
 setInterval(async()=>{
   const s=await (await fetch('/api/stats')).json();
   // o estado muda sozinho no gatilho "ia": o tile acompanha, nao so o clique
+  const espera=dur(s.espera_ia_s||600);
+  document.getElementById('gat').innerHTML = s.gatilho==='ia'
+    ? 'Gatilho <b>automatico</b>: a analise so roda quando a camera de IA avisa que tem gente, e segue de pe ate '
+      +espera+' depois do ultimo aviso. Quadra vazia = nada capturado e nada pago na nuvem.'
+    : 'Gatilho <b>manual</b>: toda camera ligada analisa o tempo todo, com ou sem gente em quadra.';
   s.cameras.forEach(c=>{
     const tg=document.getElementById('t_'+c.mid); if(!tg) return;
-    const m=(c.gatilho||{}).modo;
-    tg.textContent=c.ativa?'ANALISANDO':(m==='pausada'?'PAUSADA - SEM GENTE':'DESLIGADA');
-    tg.className='tag '+(c.ativa?'on':'off');
+    const [etiqueta,motivo,classe]=porque(c);
+    tg.textContent=etiqueta;
+    tg.className='tag '+classe;
+    document.getElementById('pq_'+c.mid).innerHTML=motivo;
     document.getElementById('c_'+c.mid).classList.toggle('on',c.ativa);
   });
   document.getElementById('tab').innerHTML=`<tr>
@@ -1096,7 +1115,7 @@ setInterval(async()=>{
     <th class=n>${s.nuvem?'servidor':'ocup'}</th><th class=n>${s.nuvem?'KB':''}</th></tr>`+
     s.cameras.map(c=>`<tr class="${c.alerta?'alerta':''}">
       <td>${c.ativa?'<b>'+c.nome+'</b>':c.nome}</td>
-      <td>${rotulo(c.gatilho)}</td>
+      <td>${porque(c)[1]}</td>
       <td class=n>${c.capturados}</td><td class=n>${c.processados}</td>
       <td class="n ${c.descartados>0?'warn':''}">${c.descartados}</td>
       <td class="n ${c.falhas>0?'bad':''}">${c.falhas}</td>
@@ -1113,6 +1132,9 @@ setInterval(async()=>{
   document.getElementById('sis').innerHTML=`
    <tr><td>pipeline</td><td><b>${s.pipeline}</b> &middot; ${s.workers} worker(s) x ${s.threads} thread(s)</td></tr>
    <tr><td>cameras ligadas</td><td>${s.ativas} de ${s.cameras.length}</td></tr>
+   <tr><td>gatilho</td><td>${s.gatilho==='ia'?'automatico pela IA da camera':'manual'}
+       <span class=sub>(analisando ${s.cameras.filter(c=>c.ativa).length}, pausadas
+       ${s.cameras.filter(c=>(c.gatilho||{}).modo==='pausada').length})</span></td></tr>
    <tr><td>capacidade usada do pool</td><td class="${cor(s.uso_pool,70,100)}">${s.uso_pool.toFixed(0)}%
        <span class=sub>(${s.inf_s.toFixed(2)} de ${s.teto_inf_s.toFixed(2)} inferencias/s)</span></td></tr>
    <tr><td>taxa de descarte</td><td class="${cor(s.pct_descarte,5,20)}">${s.pct_descarte.toFixed(1)}%</td></tr>
@@ -1646,6 +1668,7 @@ def estatisticas():
     return {
         "cameras": linhas,
         "gatilho": H.conf.d.get("gatilho", "manual"),
+        "espera_ia_s": H.conf.d.get("espera_ia_s", iamod.ESPERA_S),
         "pipeline": (pool.nome if pool else f"NUVEM {cfg['nuvem']}"),
         "nuvem": nuvem, "workers": n_w, "threads": cfg["threads"],
         "ativas": ativas,
